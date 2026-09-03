@@ -389,12 +389,17 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 		candidates := vm.DetectUplinkCandidates()
 		if len(candidates) == 0 {
 			return fmt.Errorf("no suitable uplink interface found for bridged networking (use -bridge-if to specify one, or -network user for port-forwarded access)")
-		} else if len(candidates) == 1 {
-			networkIface = candidates[0]
-		} else {
-			// Multiple candidates - will prompt in config review
-			networkIface = candidates[0] // default to first, user can change
 		}
+		// With several candidates the first one wins and the config review
+		// lets the user change it.
+		networkIface = candidates[0]
+	}
+	if *network == "bridged" && runtime.GOOS == "darwin" && networkIface == "" {
+		candidates := vm.DetectBridgeIfaceCandidates()
+		if len(candidates) == 0 {
+			return fmt.Errorf("no host interface has a link, so bridged networking would leave the VM without an address (use -bridge-if to specify one, or -network user for port-forwarded access)")
+		}
+		networkIface = candidates[0]
 	}
 
 	// For existing disks, seed memory/CPU from the disk's saved settings so
@@ -517,6 +522,17 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 	}
 
 	writeLine(stdout, "[1/3] Preparing networking")
+	if *network == "bridged" && runtime.GOOS == "darwin" {
+		// vmnet happily builds a bridge onto an interface with no link. The
+		// VM then boots, looks healthy, and never gets a lease, so refuse
+		// here instead (kairos-io/kairos#4431).
+		if err := vm.ValidateBridgeIface(networkIface); err != nil {
+			return err
+		}
+		if vm.IsWiFiIface(networkIface) {
+			writeLine(stdout, vm.WiFiBridgeWarning(networkIface))
+		}
+	}
 	if *network == "bridged" && runtime.GOOS == "linux" {
 		st.Network.BridgeInterface = networkIface
 		ok, err := confirm(stdin, stdout, *autoYes, fmt.Sprintf("bridged networking needs sudo to prepare bridge/tap (uplink: %s)", st.Network.BridgeInterface))
@@ -549,7 +565,7 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 		MemoryMB:      *memory * 1024,
 		NetworkMode:   *network,
 		DisplayMode:   *display,
-		BridgeIface:   *bridgeIface,
+		BridgeIface:   networkIface,
 		LinuxTapName:  st.Network.TapName,
 		MacOSBiosPath: biosPath,
 	})
@@ -693,7 +709,7 @@ func runStatus(stdout io.Writer, store *state.Store) error {
 	writef(stdout, "disk path: %s\n", emptyAsNone(st.VM.DiskPath))
 	writef(stdout, "network mode: %s\n", emptyAsNone(st.Network.Mode))
 	if st.Network.Mode == "bridged" {
-		writef(stdout, "bridge iface: %s\n", emptyAsNone(st.Network.BridgeInterface))
+		writef(stdout, "bridge iface: %s%s\n", emptyAsNone(st.Network.BridgeInterface), bridgeIfaceLinkNote(st.Network.BridgeInterface))
 		writef(stdout, "bridge resources: bridge=%s tap=%s\n", emptyAsNone(st.Network.BridgeName), emptyAsNone(st.Network.TapName))
 	}
 	writef(stdout, "vm running: %t\n", running)
@@ -1047,7 +1063,7 @@ func reviewVMConfig(cfg *vmStartConfig, stdin io.Reader, stdout io.Writer) (*vmS
 		writef(stdout, "  5) Memory:       %d GB%s\n", cfg.MemoryGB, ramHint)
 		writef(stdout, "  6) CPUs:         %d  (%d logical CPUs on host)\n", cfg.CPUs, runtime.NumCPU())
 		writef(stdout, "  7) Network:      %s\n", cfg.NetworkMode)
-		if cfg.NetworkMode == "bridged" && runtime.GOOS == "linux" {
+		if bridgedIfaceSelectable(cfg.NetworkMode) {
 			writef(stdout, "  8) Net interface: %s\n", cfg.NetworkIface)
 		} else {
 			writeLine(stdout, "  8) Net interface: (n/a)")
@@ -1184,8 +1200,8 @@ func reviewVMConfig(cfg *vmStartConfig, stdin io.Reader, stdout io.Writer) (*vmS
 				writeLine(stdout, "Invalid network mode, use 'bridged' or 'user'")
 			}
 		case 8:
-			if cfg.NetworkMode == "bridged" && runtime.GOOS == "linux" {
-				candidates := vm.DetectUplinkCandidates()
+			if bridgedIfaceSelectable(cfg.NetworkMode) {
+				candidates := bridgeIfaceCandidates()
 				if len(candidates) > 1 {
 					writeLine(stdout, "Available interfaces:")
 					for i, iface := range candidates {
@@ -1211,7 +1227,7 @@ func reviewVMConfig(cfg *vmStartConfig, stdin io.Reader, stdout io.Writer) (*vmS
 					}
 				}
 			} else {
-				writeLine(stdout, "Invalid option (network interface only available for bridged mode on Linux)")
+				writeLine(stdout, "Invalid option (network interface only available for bridged mode on Linux and macOS)")
 			}
 		case 9:
 			val, err := prompt(stdin, stdout, "Enter display mode (window or serial)")
@@ -1328,13 +1344,49 @@ func parseSizeGB(s string) int {
 	return n
 }
 
-func defaultBridgeIface() string {
-	if runtime.GOOS == "darwin" {
-		return "en0"
-	}
-	if runtime.GOOS == "linux" {
+// bridgeIfaceLinkNote annotates the bridge interface in `status` output with
+// its link state, so a bridge onto a dead port is visible without the user
+// having to reach for ifconfig (kairos-io/kairos#4431). It is empty on
+// platforms that do not report one.
+func bridgeIfaceLinkNote(iface string) string {
+	if iface == "" {
 		return ""
 	}
+	switch status := vm.BridgeIfaceStatus(iface); status {
+	case "":
+		return ""
+	case "active":
+		return " (link active)"
+	default:
+		return fmt.Sprintf(" (link %s - the VM will not get an address over this interface)", status)
+	}
+}
+
+// bridgeIfaceCandidates lists the host interfaces bridged networking can use,
+// most likely first. Linux bridges through a NetworkManager uplink, macOS
+// through vmnet, so the two enumerate different things.
+func bridgeIfaceCandidates() []string {
+	switch runtime.GOOS {
+	case "linux":
+		return vm.DetectUplinkCandidates()
+	case "darwin":
+		return vm.DetectBridgeIfaceCandidates()
+	}
+	return nil
+}
+
+// bridgedIfaceSelectable reports whether the network interface is the user's
+// to choose in this configuration.
+func bridgedIfaceSelectable(networkMode string) bool {
+	return networkMode == "bridged" && (runtime.GOOS == "linux" || runtime.GOOS == "darwin")
+}
+
+// defaultBridgeIface leaves the bridge interface unset on every platform. It
+// used to answer "en0" on macOS, which bridged the VM onto the built-in
+// Ethernet port even when that port had no cable in it (kairos-io/kairos#4431).
+// The interface is resolved from the host's default route in runStart instead,
+// where it can also be validated.
+func defaultBridgeIface() string {
 	return ""
 }
 
