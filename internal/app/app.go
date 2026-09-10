@@ -40,6 +40,11 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer, version strin
 	case "start":
 		return runStart(args[1:], stdin, stdout, stderr, store)
 	case "status":
+		// status builds no flag set, so it has no NArg to check; it used to
+		// ignore anything after the verb outright. See rejectPositionalArgs.
+		if len(args) > 1 {
+			return fmt.Errorf("unexpected argument %q: status takes no arguments", args[1])
+		}
 		return runStatus(stdout, store)
 	case "reset":
 		return runReset(args[1:], stdin, stdout, store)
@@ -57,10 +62,33 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer, version strin
 	}
 }
 
+// rejectPositionalArgs fails a subcommand that was handed a positional
+// argument. Every kairos-lab option is a flag, so a leftover argument is
+// always a mistake, and it used to be a silent one: `kairos-lab start
+// /path/to.iso` parsed the path into the flag set's remaining args and dropped
+// it, so -iso stayed empty and iso.ResolveForStart auto-selected whatever was
+// in the download cache. The VM booted from an image the user never named and
+// nothing said so (kairos-io/kairos#4432).
+//
+// hint names the flag that carries the value the user probably meant, so the
+// error points at the interface instead of only rejecting the input.
+func rejectPositionalArgs(fs *flag.FlagSet, hint string) error {
+	if fs.NArg() == 0 {
+		return nil
+	}
+	if hint != "" {
+		return fmt.Errorf("unexpected argument %q: %s", fs.Arg(0), hint)
+	}
+	return fmt.Errorf("unexpected argument %q: %s takes flags only", fs.Arg(0), fs.Name())
+}
+
 func runSetup(args []string, stdin io.Reader, stdout, _ io.Writer, store *state.Store) error {
 	fs := flag.NewFlagSet("setup", flag.ContinueOnError)
 	autoYes := fs.Bool("yes", false, "auto-confirm installs and sudo operations")
 	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if err := rejectPositionalArgs(fs, ""); err != nil {
 		return err
 	}
 
@@ -274,6 +302,9 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 	bridgeIface := fs.String("bridge-if", defaultBridgeIface(), "bridge interface (macOS vmnet or Linux uplink iface)")
 	autoYes := fs.Bool("yes", false, "auto-confirm sudo operations")
 	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if err := rejectPositionalArgs(fs, "pass the ISO with -iso"); err != nil {
 		return err
 	}
 	if *network != "bridged" && *network != "user" {
@@ -714,6 +745,9 @@ func runReset(args []string, stdin io.Reader, stdout io.Writer, store *state.Sto
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	if err := rejectPositionalArgs(fs, "remove a single disk with -disk"); err != nil {
+		return err
+	}
 
 	st, err := store.Load()
 	if err != nil {
@@ -825,6 +859,9 @@ func runCleanup(args []string, stdin io.Reader, stdout io.Writer, store *state.S
 	autoYes := fs.Bool("yes", false, "auto-confirm destructive operations")
 	dryRun := fs.Bool("dry-run", false, "show what would be removed")
 	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if err := rejectPositionalArgs(fs, ""); err != nil {
 		return err
 	}
 
