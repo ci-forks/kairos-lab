@@ -3,6 +3,7 @@ package app
 import (
 	"bytes"
 	"errors"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -61,5 +62,40 @@ func TestRunAcceptsSubcommandsWithoutPositionalArguments(t *testing.T) {
 		if !errors.Is(err, errSetupRequired) {
 			t.Fatalf("%v: got %v, want %v", args, err, errSetupRequired)
 		}
+	}
+}
+
+// The config review can turn bridged mode on (option 7) without the interface
+// (option 8) ever being touched, and runStart used to resolve the interface
+// only before the review. The VM then reached ValidateBridgeIface with an
+// empty name, which reported a link problem for an interface it never named.
+// See kairos-io/kairos#4649.
+func TestResolveBridgeIface(t *testing.T) {
+	// User mode has no interface to resolve, and an interface the user chose
+	// is never second-guessed. Neither case may probe the host.
+	for _, tc := range []struct{ mode, iface string }{
+		{"user", ""},
+		{"user", "en1"},
+		{"bridged", "en1"},
+	} {
+		got, err := resolveBridgeIface(tc.mode, tc.iface)
+		if err != nil {
+			t.Fatalf("resolveBridgeIface(%q, %q) errored: %v", tc.mode, tc.iface, err)
+		}
+		if got != tc.iface {
+			t.Errorf("resolveBridgeIface(%q, %q) = %q, want it unchanged", tc.mode, tc.iface, got)
+		}
+	}
+
+	// Bridged with no interface must come back with one or say why not. The
+	// answer depends on the host's own links, but "" with no error is the
+	// combination that produced the empty-name message, and it is never
+	// right.
+	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
+		return
+	}
+	iface, err := resolveBridgeIface("bridged", "")
+	if err == nil && iface == "" {
+		t.Fatal("bridged mode resolved to no interface and no error")
 	}
 }

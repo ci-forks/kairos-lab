@@ -41,10 +41,15 @@ func DetectBridgeIfaceCandidates() []string {
 	return candidates
 }
 
-// ValidateBridgeIface fails when the chosen interface has no link, naming the
-// interfaces that do.
+// ValidateBridgeIface rejects a chosen interface that vmnet cannot bridge
+// onto, or that has no link, naming the interfaces that can.
 func ValidateBridgeIface(iface string) error {
-	return validateBridgeIface(iface, darwinIfaceStatus(iface), DetectBridgeIfaceCandidates())
+	return validateBridgeIface(
+		iface,
+		darwinIfaceStatus(iface),
+		parseDarwinIfaceList(darwinRun("ifconfig", "-l")),
+		DetectBridgeIfaceCandidates(),
+	)
 }
 
 // IsWiFiIface reports whether the interface is a Wi-Fi radio.
