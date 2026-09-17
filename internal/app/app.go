@@ -1229,6 +1229,19 @@ func reviewVMConfig(cfg *vmStartConfig, stdin io.Reader, stdout io.Writer) (*vmS
 			}
 			if val == "bridged" || val == "user" {
 				cfg.NetworkMode = val
+				// Option 7 is the only way bridged mode gets turned on from
+				// inside the review, and option 8 renders cfg.NetworkIface
+				// verbatim, so resolve it now or the menu redraws with a blank
+				// interface and the user confirms the configuration without
+				// ever seeing which one the VM will use. runStart resolves
+				// again after the review as a backstop
+				// (kairos-io/kairos#4649).
+				iface, err := resolveBridgeIface(cfg.NetworkMode, cfg.NetworkIface)
+				if err != nil {
+					writef(stdout, "%v\n", err)
+				} else {
+					cfg.NetworkIface = iface
+				}
 			} else if val != "" {
 				writeLine(stdout, "Invalid network mode, use 'bridged' or 'user'")
 			}
@@ -1259,7 +1272,7 @@ func reviewVMConfig(cfg *vmStartConfig, stdin io.Reader, stdout io.Writer) (*vmS
 						// Free text walks past the filter
 						// DetectBridgeIfaceCandidates applies, so check it
 						// here too (kairos-io/kairos#4649).
-						if err := vm.ValidateBridgeIface(val); err != nil {
+						if err := vm.ValidateReviewBridgeIface(val); err != nil {
 							writef(stdout, "%v\n", err)
 							break
 						}

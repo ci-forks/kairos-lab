@@ -3,9 +3,12 @@ package app
 import (
 	"bytes"
 	"errors"
+	"io"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
+	"testing/iotest"
 )
 
 // Every kairos-lab option is a flag, so a positional argument is always a
@@ -97,5 +100,58 @@ func TestResolveBridgeIface(t *testing.T) {
 	iface, err := resolveBridgeIface("bridged", "")
 	if err == nil && iface == "" {
 		t.Fatal("bridged mode resolved to no interface and no error")
+	}
+}
+
+// reviewInput feeds the config review one line at a time. reviewVMConfig
+// builds a fresh bufio.Reader on every pass of its loop, and a plain
+// strings.Reader is drained into the first one's buffer, so the second pass
+// sees EOF and the review returns "cancelled". Reading a byte at a time is
+// what a terminal does anyway.
+func reviewInput(lines ...string) io.Reader {
+	return iotest.OneByteReader(strings.NewReader(strings.Join(lines, "\n") + "\n"))
+}
+
+// Switching option 7 to bridged has to leave the review with an interface in
+// hand. TestResolveBridgeIface covers the helper, but nothing asserted that
+// the review calls it, and the bug was the wiring: the menu redrew
+// "8) Net interface:" with nothing after it and the user confirmed a
+// configuration whose interface was still empty (kairos-io/kairos#4649).
+func TestReviewResolvesIfaceWhenModeSwitchesToBridged(t *testing.T) {
+	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
+		t.Skipf("no bridge interface to resolve on %s", runtime.GOOS)
+	}
+
+	cfg := &vmStartConfig{
+		DiskName:    "test",
+		DiskPath:    filepath.Join(t.TempDir(), "test.qcow2"),
+		DiskSize:    "20G",
+		MemoryGB:    4,
+		CPUs:        2,
+		NetworkMode: "user",
+		Display:     "serial",
+		IsNewDisk:   true,
+	}
+
+	var stdout bytes.Buffer
+	// Option 7, switch to bridged, then Enter to accept.
+	got, err := reviewVMConfig(cfg, reviewInput("7", "bridged", ""), &stdout)
+	if err != nil {
+		t.Fatalf("review errored: %v", err)
+	}
+	if got.NetworkMode != "bridged" {
+		t.Fatalf("network mode is %q, want bridged", got.NetworkMode)
+	}
+
+	// Either an interface came out, or the review said why one could not.
+	// Silently empty is the combination the VM cannot start from.
+	if got.NetworkIface == "" && !strings.Contains(stdout.String(), "bridged networking") {
+		t.Fatalf("bridged mode left the interface empty and said nothing about it; review output:\n%s", stdout.String())
+	}
+
+	// The menu redraws after the switch, and that redraw is what the user
+	// confirms. It may not show an empty interface.
+	if got.NetworkIface != "" && strings.Contains(stdout.String(), "8) Net interface: \n") {
+		t.Errorf("the review rendered a blank interface before asking for confirmation; output:\n%s", stdout.String())
 	}
 }

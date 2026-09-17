@@ -42,13 +42,26 @@ func DetectBridgeIfaceCandidates() []string {
 }
 
 // ValidateBridgeIface rejects a chosen interface that vmnet cannot bridge
-// onto, or that has no link, naming the interfaces that can.
+// onto, or that has no link, naming the interfaces that can. The advice it
+// carries is worded for a command line.
 func ValidateBridgeIface(iface string) error {
+	return validateBridgeIfaceOnHost(iface, FlagBridgeControls)
+}
+
+// ValidateReviewBridgeIface is ValidateBridgeIface for a name typed into the
+// interactive config review, where -bridge-if and -network are no longer the
+// controls the user can reach.
+func ValidateReviewBridgeIface(iface string) error {
+	return validateBridgeIfaceOnHost(iface, ReviewBridgeControls)
+}
+
+func validateBridgeIfaceOnHost(iface, controls string) error {
 	return validateBridgeIface(
 		iface,
 		darwinIfaceStatus(iface),
 		parseDarwinIfaceList(darwinRun("ifconfig", "-l")),
 		DetectBridgeIfaceCandidates(),
+		controls,
 	)
 }
 
