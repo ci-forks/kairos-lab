@@ -122,3 +122,73 @@ func TestBuildLinuxCommandWindowDisplayOmitsNographic(t *testing.T) {
 		t.Fatalf("expected RFC1918 user slirp net in args: %s", joined)
 	}
 }
+
+// qemu-system-aarch64 has no default machine, so the arm64 command line the
+// tool used to build died with "No machine specified, and there is no
+// default" before it ever read the ISO. See kairos-io/kairos#4858. The
+// architecture is a parameter so this runs on an amd64 host too.
+func TestBuildLinuxARM64SuppliesMachineAcceleratorAndFirmware(t *testing.T) {
+	_, args, err := buildLinuxFor("arm64", StartConfig{
+		ISOPath:     "/tmp/kairos.iso",
+		DiskPath:    "/tmp/kairos.qcow2",
+		CPUs:        2,
+		MemoryMB:    4096,
+		NetworkMode: "user",
+		BiosPath:    "/usr/share/AAVMF/QEMU_EFI.fd",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(args, " ")
+	for _, want := range []string{
+		"-machine virt,gic-version=max",
+		"-cpu host",
+		"-enable-kvm",
+		"-bios /usr/share/AAVMF/QEMU_EFI.fd",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("arm64 args are missing %q: %s", want, joined)
+		}
+	}
+}
+
+// A machine type belongs to arm64 only: adding it on amd64 would override the
+// default q35/pc selection.
+func TestBuildLinuxAMD64KeepsTheDefaultMachine(t *testing.T) {
+	binary, args, err := buildLinuxFor("amd64", StartConfig{
+		DiskPath:    "/tmp/kairos.qcow2",
+		CPUs:        2,
+		MemoryMB:    4096,
+		NetworkMode: "user",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if binary != "qemu-system-x86_64" {
+		t.Errorf("got binary %q, want qemu-system-x86_64", binary)
+	}
+	joined := strings.Join(args, " ")
+	if strings.Contains(joined, "-machine") || strings.Contains(joined, "-bios") {
+		t.Errorf("amd64 should not carry a machine or firmware: %s", joined)
+	}
+	if !strings.Contains(joined, "-enable-kvm -cpu host") {
+		t.Errorf("amd64 lost its accelerator: %s", joined)
+	}
+}
+
+// Without firmware the guest boots to a blank screen, so refuse to build the
+// command at all, the way the macOS path already does.
+func TestBuildLinuxARM64RejectsAnEmptyFirmwarePath(t *testing.T) {
+	binary, args, err := buildLinuxFor("arm64", StartConfig{
+		DiskPath:    "/tmp/kairos.qcow2",
+		CPUs:        2,
+		MemoryMB:    4096,
+		NetworkMode: "user",
+	})
+	if err == nil {
+		t.Fatalf("expected an error, got %s %v", binary, args)
+	}
+	if !strings.Contains(err.Error(), "firmware") {
+		t.Errorf("error %q should name the missing firmware", err)
+	}
+}

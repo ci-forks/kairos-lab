@@ -611,8 +611,14 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 	}
 
 	biosPath := ""
-	if runtime.GOOS == "darwin" {
+	switch {
+	case runtime.GOOS == "darwin":
 		biosPath, err = macOSFirmwarePath()
+		if err != nil {
+			return err
+		}
+	case runtime.GOOS == "linux" && runtime.GOARCH == "arm64":
+		biosPath, err = linuxARM64FirmwarePath()
 		if err != nil {
 			return err
 		}
@@ -630,7 +636,7 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 		DisplayMode:   *display,
 		BridgeIface:   networkIface,
 		LinuxTapName:  st.Network.TapName,
-		MacOSBiosPath: biosPath,
+		BiosPath:      biosPath,
 	})
 	if err != nil {
 		return err
@@ -1630,6 +1636,38 @@ func resolveNetworkMode(mode string) (string, error) {
 		}
 		return "", fmt.Errorf(msg, m)
 	}
+}
+
+// linuxARM64Firmware lists the EDK2 builds the distributions install, most
+// portable first. The paths come from the packages named in qemuDependency:
+// aavmf on Alpine, qemu-efi-aarch64 on Debian and Ubuntu, edk2-aarch64 on
+// Fedora and Arch, qemu-uefi-aarch64 on openSUSE.
+var linuxARM64Firmware = []string{
+	"/usr/share/AAVMF/QEMU_EFI.fd",
+	"/usr/share/qemu-efi-aarch64/QEMU_EFI.fd",
+	"/usr/share/edk2/aarch64/QEMU_EFI.fd",
+	"/usr/share/edk2/aarch64/QEMU_CODE.fd",
+	"/usr/share/qemu/qemu-uefi-aarch64.bin",
+	"/usr/share/AAVMF/AAVMF_CODE.fd",
+}
+
+// linuxARM64FirmwarePath answers with the UEFI image an arm64 guest boots
+// from. QEMU's virt machine has no built-in firmware, so without one of these
+// the VM starts and shows nothing (kairos-io/kairos#4858).
+func linuxARM64FirmwarePath() (string, error) {
+	if path := firstExistingFile(linuxARM64Firmware); path != "" {
+		return path, nil
+	}
+	return "", fmt.Errorf("arm64 UEFI firmware not found in %s: install it with your package manager (qemu-efi-aarch64, edk2-aarch64, aavmf or qemu-uefi-aarch64)", strings.Join(linuxARM64Firmware, ", "))
+}
+
+func firstExistingFile(candidates []string) string {
+	for _, path := range candidates {
+		if info, err := os.Stat(path); err == nil && !info.IsDir() {
+			return path
+		}
+	}
+	return ""
 }
 
 func macOSFirmwarePath() (string, error) {

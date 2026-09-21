@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"io"
+	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -153,5 +154,44 @@ func TestReviewResolvesIfaceWhenModeSwitchesToBridged(t *testing.T) {
 	// confirms. It may not show an empty interface.
 	if got.NetworkIface != "" && strings.Contains(stdout.String(), "8) Net interface: \n") {
 		t.Errorf("the review rendered a blank interface before asking for confirmation; output:\n%s", stdout.String())
+	}
+}
+
+// The firmware search has to accept the first candidate that is a real file,
+// and ignore a directory that happens to carry the same name.
+func TestFirstExistingFile(t *testing.T) {
+	dir := t.TempDir()
+	missing := filepath.Join(dir, "absent.fd")
+	asDir := filepath.Join(dir, "as-dir.fd")
+	present := filepath.Join(dir, "present.fd")
+	if err := os.Mkdir(asDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(present, []byte("firmware"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := firstExistingFile([]string{missing, asDir, present}); got != present {
+		t.Errorf("got %q, want %q", got, present)
+	}
+	if got := firstExistingFile([]string{missing}); got != "" {
+		t.Errorf("got %q, want an empty path", got)
+	}
+}
+
+// An arm64 guest boots nothing without EDK2, so the failure has to say which
+// package supplies it (kairos-io/kairos#4858).
+func TestLinuxARM64FirmwarePathNamesTheCandidates(t *testing.T) {
+	if firstExistingFile(linuxARM64Firmware) != "" {
+		t.Skip("this host has arm64 firmware installed")
+	}
+	_, err := linuxARM64FirmwarePath()
+	if err == nil {
+		t.Fatal("expected an error when no firmware is installed")
+	}
+	for _, want := range []string{"/usr/share/AAVMF/QEMU_EFI.fd", "qemu-efi-aarch64"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q should mention %q", err, want)
+		}
 	}
 }

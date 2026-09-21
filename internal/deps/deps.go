@@ -3,7 +3,6 @@ package deps
 import (
 	"fmt"
 	"os/exec"
-	"runtime"
 	"sort"
 
 	"github.com/kairos-io/kairos-lab/internal/platform"
@@ -107,13 +106,28 @@ func qemuDependency(info platform.Info) Dependency {
 			},
 		}
 	}
-	binary := "qemu-system-x86_64"
-	if runtime.GOARCH == "arm64" {
-		binary = "qemu-system-aarch64"
+	if info.Arch == "arm64" {
+		// An arm64 host needs the arm64 emulator and the EDK2 firmware that
+		// goes with it. Naming the x86 packages here installed a qemu that
+		// DetectPresent could never find, so setup asked for the same
+		// packages forever (kairos-io/kairos#4858).
+		return Dependency{
+			Name:     "qemu",
+			Binaries: []string{"qemu-system-aarch64", "qemu-img"},
+			InstallPackages: map[string][]string{
+				"apt":    {"qemu-system-arm", "qemu-efi-aarch64", "qemu-utils"},
+				"dnf":    {"qemu-system-aarch64", "edk2-aarch64", "qemu-img"},
+				"yum":    {"qemu-kvm", "edk2-aarch64", "qemu-img"},
+				"zypper": {"qemu-arm", "qemu-uefi-aarch64", "qemu-tools"},
+				"pacman": {"qemu-system-aarch64", "edk2-aarch64"},
+				"apk":    {"qemu-system-aarch64", "aavmf", "qemu-img"},
+				"brew":   {"qemu"},
+			},
+		}
 	}
 	return Dependency{
 		Name:     "qemu",
-		Binaries: []string{binary, "qemu-img"},
+		Binaries: []string{"qemu-system-x86_64", "qemu-img"},
 		InstallPackages: map[string][]string{
 			"apt":    {"qemu-system-x86", "qemu-utils"},
 			"dnf":    {"qemu-system-x86", "qemu-img"},
