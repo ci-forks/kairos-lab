@@ -60,7 +60,7 @@ type StartConfig struct {
 	DisplayMode   string
 	BridgeIface   string
 	LinuxTapName  string
-	MacOSBiosPath string
+	BiosPath      string
 	Detached      bool
 }
 
@@ -164,23 +164,44 @@ func IsRunning(pid int) (bool, error) {
 }
 
 func buildLinux(cfg StartConfig) (string, []string, error) {
+	return buildLinuxFor(runtime.GOARCH, cfg)
+}
+
+// buildLinuxFor takes the architecture as an argument so the arm64 command
+// line can be exercised from an amd64 test host.
+func buildLinuxFor(goarch string, cfg StartConfig) (string, []string, error) {
 	binary := "qemu-system-x86_64"
-	if runtime.GOARCH == "arm64" {
+	if goarch == "arm64" {
 		binary = "qemu-system-aarch64"
 	}
 	if cfg.DisplayMode == "" {
 		cfg.DisplayMode = "serial"
 	}
 	args := []string{}
-	if runtime.GOARCH == "amd64" {
+	switch goarch {
+	case "amd64":
 		args = append(args, "-enable-kvm", "-cpu", "host")
+	case "arm64":
+		// qemu-system-aarch64 has no default machine, and the virt machine
+		// carries no firmware of its own, so QEMU exits with "No machine
+		// specified" long before it reaches the ISO unless both are spelled
+		// out here (kairos-io/kairos#4858).
+		if cfg.BiosPath == "" {
+			return "", nil, fmt.Errorf("missing qemu firmware path for arm64")
+		}
+		args = append(args,
+			"-enable-kvm",
+			"-machine", "virt,gic-version=max",
+			"-cpu", "host",
+			"-bios", cfg.BiosPath,
+		)
 	}
 	switch cfg.DisplayMode {
 	case "serial":
 		args = append(args, "-nographic", "-serial", "mon:stdio")
 	case "window":
 		args = append(args, "-display", "default", "-serial", "mon:stdio")
-		if runtime.GOARCH == "arm64" {
+		if goarch == "arm64" {
 			args = append(args,
 				"-device", "virtio-gpu-pci",
 				"-device", "qemu-xhci",
@@ -236,7 +257,7 @@ func buildMacOS(cfg StartConfig) (string, []string, error) {
 		cfg.DisplayMode = "serial"
 	}
 	binary := "qemu-system-aarch64"
-	if cfg.MacOSBiosPath == "" {
+	if cfg.BiosPath == "" {
 		return "", nil, fmt.Errorf("missing macOS qemu firmware path")
 	}
 	if cfg.NetworkMode == "bridged" && cfg.BridgeIface == "" {
@@ -250,7 +271,7 @@ func buildMacOS(cfg StartConfig) (string, []string, error) {
 		"-cpu", "host",
 		"-smp", strconv.Itoa(cfg.CPUs),
 		"-m", strconv.Itoa(cfg.MemoryMB),
-		"-bios", cfg.MacOSBiosPath,
+		"-bios", cfg.BiosPath,
 	}
 	switch cfg.DisplayMode {
 	case "serial":
