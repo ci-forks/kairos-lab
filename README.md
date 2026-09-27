@@ -67,8 +67,8 @@ Detects your package manager and installs required tools (`qemu`) if missing.
 ```
 
 Interactive selection of:
-- Image type: `core` (base OS) or `standard` (with K3s)
-- K3s version (if standard)
+- Image type: `core` (base OS) or `standard` (with Kubernetes)
+- Kubernetes distribution and version, k3s or k0s (if standard)
 
 The ISO is saved to the cache directory and tracked for cleanup.
 
@@ -109,7 +109,7 @@ Select your existing disk - it will boot from disk without the ISO.
 Downloads a Kairos ISO with interactive selection:
 - Fetches latest release from GitHub
 - Filters by your architecture (amd64/arm64)
-- Prompts for core vs standard, K3s version
+- Prompts for core vs standard, then the Kubernetes distribution and version
 
 ### `start`
 
