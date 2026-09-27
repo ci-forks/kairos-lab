@@ -236,14 +236,25 @@ func downloadISO(rawURL, downloadsDir string, stdout io.Writer) (string, error) 
 		return "", fmt.Errorf("download iso: unexpected status %d", resp.StatusCode)
 	}
 
-	f, err := os.Create(target)
+	// Write to a temporary file next to the target and rename only once the
+	// whole body has arrived. The cache check above is a bare os.Stat, so a
+	// partial file at the target path would be served as a complete ISO on
+	// every later run, and the VM would boot a truncated image with nothing
+	// pointing back at the download.
+	f, err := os.CreateTemp(downloadsDir, base+".part-*")
 	if err != nil {
 		return "", fmt.Errorf("create iso file: %w", err)
 	}
+	tmpPath := f.Name()
 	defer func() {
 		_ = f.Close()
+		// Removing the temporary file is a no-op once the rename below has
+		// moved it, and clears it on every error path before that.
+		_ = os.Remove(tmpPath)
 	}()
 
+	// A body that stops short of the announced Content-Length reaches us as an
+	// error from io.Copy, so the copy succeeding is enough to rename on.
 	totalSize := resp.ContentLength
 	if totalSize > 0 {
 		pw := &progressWriter{
@@ -258,6 +269,13 @@ func downloadISO(rawURL, downloadsDir string, stdout io.Writer) (string, error) 
 		if _, err := io.Copy(f, resp.Body); err != nil {
 			return "", fmt.Errorf("write iso file: %w", err)
 		}
+	}
+
+	if err := f.Close(); err != nil {
+		return "", fmt.Errorf("write iso file: %w", err)
+	}
+	if err := os.Rename(tmpPath, target); err != nil {
+		return "", fmt.Errorf("finalize iso file: %w", err)
 	}
 	return target, nil
 }
