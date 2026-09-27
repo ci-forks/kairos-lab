@@ -4776,6 +4776,21 @@ func stubIsWiFiIface(t *testing.T, wifi bool) {
 	isWiFiIface = func(string) bool { return wifi }
 }
 
+// stubValidateBridgeIface answers the host link check with a fixed verdict.
+//
+// Every bridged `start` test below needs this, and on darwin it needs it to
+// get anywhere at all: vm.ValidateBridgeIface is a no-op off darwin, but the
+// darwin one reads `ifconfig -l` and rejects any name that is not on the
+// host, so the run returns at "[1/3] Preparing networking" and prints
+// nothing further. That is why these tests were green on the ubuntu leg and
+// red on the macOS one.
+func stubValidateBridgeIface(t *testing.T, err error) {
+	t.Helper()
+	saved := validateBridgeIface
+	t.Cleanup(func() { validateBridgeIface = saved })
+	validateBridgeIface = func(string) error { return err }
+}
+
 // A bridged run onto a Wi-Fi radio says so before it starts, on Linux as on
 // macOS (kairos-io/kairos#5021).
 //
@@ -4801,6 +4816,7 @@ func TestStartWarnsWhenTheBridgedUplinkIsWiFi(t *testing.T) {
 	seedStartableState(t, "kairos-disk0")
 	stubNetworkPrivilege(t, func(string) error { return nil })
 	stubBridgeIfaceCandidates(t, "kairos-fake-wlan0")
+	stubValidateBridgeIface(t, nil)
 	stubIsWiFiIface(t, true)
 
 	// Enter at the review, Enter to start, then refuse the privilege prompt,
@@ -4832,14 +4848,65 @@ func TestStartDoesNotWarnWhenTheBridgedUplinkIsNotWiFi(t *testing.T) {
 	seedStartableState(t, "kairos-disk0")
 	stubNetworkPrivilege(t, func(string) error { return nil })
 	stubBridgeIfaceCandidates(t, "kairos-fake-uplink0")
+	stubValidateBridgeIface(t, nil)
 	stubIsWiFiIface(t, false)
 
 	var stdout, stderr bytes.Buffer
-	_ = Run([]string{"start", "-name", "kairos-disk0", "-no-iso", "-network", "bridged"},
+	err := Run([]string{"start", "-name", "kairos-disk0", "-no-iso", "-network", "bridged"},
 		scriptedInput("\n\nn\n"), &stdout, &stderr, "test")
 
+	// An absence assertion is only worth as much as the proof that the run
+	// reached the place the thing would have been printed, and this one very
+	// nearly was not: on darwin the real vm.ValidateBridgeIface above returns
+	// "no such interface kairos-fake-uplink0 on this host", runStart returns
+	// it, and nothing after "[1/3] Preparing networking" is ever written. The
+	// caveat's absence then says nothing at all.
+	//
+	// Every message that validator can produce names the interface, and no
+	// error raised after it does -- the run ends at the sudo prompt on Linux
+	// and at the PATH-isolated qemu launch on macOS -- so this separates
+	// "ran, and did not warn" from "never got there".
+	if err != nil && strings.Contains(err.Error(), "kairos-fake-uplink0") {
+		t.Fatalf("the run was refused at the bridge interface check and never reached the caveat, so its absence proves nothing: %v", err)
+	}
 	if out := stdout.String(); strings.Contains(out, "is Wi-Fi") {
 		t.Errorf("a bridged start onto an Ethernet interface printed the Wi-Fi caveat; stdout:\n%s", out)
+	}
+}
+
+// The other half of the seam: a bridge interface the host cannot carry is a
+// refusal, and it comes first, so a run that is about to be rejected does not
+// also lecture the user about access points. The caveat and the refusal live
+// one after the other in the same block and this is what pins their order.
+//
+// It is darwin-only because the carrier check is: vm.ValidateBridgeIface is
+// `return nil` off darwin, and kairos-io/kairos#5021 deliberately left the
+// Linux half of kairos-io/kairos#4431 unbuilt rather than guess at whether
+// NetworkManager will activate a carrier-less ethernet slave.
+func TestStartRefusesADeadBridgeIfaceBeforeWarningAboutWiFi(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skipf("vm.ValidateBridgeIface is a no-op on %s, so there is no refusal to order the caveat against", runtime.GOOS)
+	}
+	t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
+	t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
+	isolateFromHostBinaries(t)
+	seedStartableState(t, "kairos-disk0")
+	stubNetworkPrivilege(t, func(string) error { return nil })
+	stubBridgeIfaceCandidates(t, "kairos-fake-wlan0")
+	stubValidateBridgeIface(t, errors.New("bridge interface kairos-fake-wlan0 is inactive"))
+	// True, so that a caveat printed here could only be one printed ahead of
+	// the refusal rather than one the detector declined to raise.
+	stubIsWiFiIface(t, true)
+
+	var stdout, stderr bytes.Buffer
+	err := Run([]string{"start", "-name", "kairos-disk0", "-no-iso", "-network", "bridged"},
+		scriptedInput("\n\nn\n"), &stdout, &stderr, "test")
+
+	if err == nil || !strings.Contains(err.Error(), "is inactive") {
+		t.Fatalf("start returned %v, want the bridge interface refusal -- the seam is not wired into runStart; stdout:\n%s", err, stdout.String())
+	}
+	if out := stdout.String(); strings.Contains(out, "is Wi-Fi") {
+		t.Errorf("the Wi-Fi caveat was printed for a run that was then refused anyway; stdout:\n%s", out)
 	}
 }
 
@@ -4886,5 +4953,15 @@ func TestStartDoesNotWarnAboutWiFiOutsideBridgedMode(t *testing.T) {
 func TestWiFiSeamIsTheRealDetector(t *testing.T) {
 	if got, want := reflect.ValueOf(isWiFiIface).Pointer(), reflect.ValueOf(vm.IsWiFiIface).Pointer(); got != want {
 		t.Error("the app layer's Wi-Fi seam is not vm.IsWiFiIface, so what a real run asks is not what the tests pin")
+	}
+}
+
+// And the same for the validator beside it, which every bridged test above
+// now replaces. A default that had drifted to `func(string) error { return
+// nil }` would leave them all green while a real macOS run bridged onto a
+// dead port, which is the failure kairos-io/kairos#4431 was filed for.
+func TestBridgeIfaceSeamIsTheRealValidator(t *testing.T) {
+	if got, want := reflect.ValueOf(validateBridgeIface).Pointer(), reflect.ValueOf(vm.ValidateBridgeIface).Pointer(); got != want {
+		t.Error("the app layer's bridge interface seam is not vm.ValidateBridgeIface, so what a real run checks is not what the tests pin")
 	}
 }

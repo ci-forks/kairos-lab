@@ -744,7 +744,7 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 			// question has no Linux half yet: NetworkManager may refuse to
 			// activate a carrier-less ethernet slave on its own, and until
 			// that is settled a refusal here would be this tool guessing.
-			if err := vm.ValidateBridgeIface(networkIface); err != nil {
+			if err := validateBridgeIface(networkIface); err != nil {
 				return err
 			}
 		}
@@ -2569,6 +2569,26 @@ func bridgeIfaceLinkNote(iface string) string {
 //
 // Nothing in production assigns it; the tests restore it with t.Cleanup.
 var isWiFiIface = vm.IsWiFiIface
+
+// validateBridgeIface is vm.ValidateBridgeIface behind a package-level var,
+// for the same reason isWiFiIface above is one: the darwin implementation
+// asks the host. It reads `ifconfig -l` for the names that exist and
+// `ifconfig <iface>` for the link status, so a name invented by a test is
+// rejected as "no such interface on this host" before the run reaches
+// anything that test wants to pin. Off darwin it returns nil without looking
+// at anything, which is why the gap it left was invisible until a bridged
+// `start` test ran on the macOS leg.
+//
+// The ordering it sits in front of is deliberate and stays: a link that
+// cannot carry a bridge is a refusal, and there is no point warning about
+// the radio on an interface the run is about to reject anyway.
+//
+// It is vm.ValidateBridgeIface itself and not a closure, for the reason
+// TestWiFiSeamIsTheRealDetector gives about the seam next to it, and
+// TestBridgeIfaceSeamIsTheRealValidator asserts the same thing here.
+//
+// Nothing in production assigns it; the tests restore it with t.Cleanup.
+var validateBridgeIface = vm.ValidateBridgeIface
 
 // bridgeIfaceCandidates lists the host interfaces bridged networking can use,
 // most likely first. Linux bridges through a NetworkManager uplink, macOS
