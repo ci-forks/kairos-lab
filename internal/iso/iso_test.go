@@ -95,7 +95,7 @@ func TestInterruptedDownloadLeavesNoCachedISO(t *testing.T) {
 
 	dir := t.TempDir()
 	var out bytes.Buffer
-	if _, err := downloadISO(srv.URL+"/kairos.iso", dir, &out); err == nil {
+	if _, err := downloadISO(srv.URL+"/kairos.iso", sha256Hex(full), dir, &out); err == nil {
 		t.Fatal("interrupted download reported success")
 	}
 
@@ -135,7 +135,7 @@ func TestDownloadAfterAnInterruptedOneRefetches(t *testing.T) {
 
 	bad := truncatingServer(t, full, 1024)
 	var out bytes.Buffer
-	if _, err := downloadISO(bad.URL+"/kairos.iso", dir, &out); err == nil {
+	if _, err := downloadISO(bad.URL+"/kairos.iso", sha256Hex(full), dir, &out); err == nil {
 		t.Fatal("interrupted download reported success")
 	}
 	bad.Close()
@@ -146,7 +146,7 @@ func TestDownloadAfterAnInterruptedOneRefetches(t *testing.T) {
 	defer good.Close()
 
 	out.Reset()
-	path, err := downloadISO(good.URL+"/kairos.iso", dir, &out)
+	path, err := downloadISO(good.URL+"/kairos.iso", sha256Hex(full), dir, &out)
 	if err != nil {
 		t.Fatalf("retry failed: %v", err)
 	}
@@ -173,7 +173,7 @@ func TestCompletedDownloadLeavesOnlyTheISO(t *testing.T) {
 
 	dir := t.TempDir()
 	var out bytes.Buffer
-	path, err := downloadISO(srv.URL+"/kairos.iso", dir, &out)
+	path, err := downloadISO(srv.URL+"/kairos.iso", sha256Hex(full), dir, &out)
 	if err != nil {
 		t.Fatalf("download: %v", err)
 	}
@@ -195,10 +195,165 @@ func TestCompletedDownloadLeavesOnlyTheISO(t *testing.T) {
 
 	// The second call must now take the cache path.
 	out.Reset()
-	if _, err := downloadISO(srv.URL+"/kairos.iso", dir, &out); err != nil {
+	if _, err := downloadISO(srv.URL+"/kairos.iso", sha256Hex(full), dir, &out); err != nil {
 		t.Fatalf("cached download: %v", err)
 	}
 	if !strings.Contains(out.String(), "Using cached ISO") {
 		t.Fatalf("a complete ISO was not served from the cache: %q", out.String())
+	}
+}
+
+// A full-length download that is not the ISO the release published must never
+// reach the target path. Before the checksum was consulted this file was
+// indistinguishable from a good one: it is complete, it is the right size, and
+// every later run reported it as cached.
+func TestCorruptDownloadIsRejectedAndNotCached(t *testing.T) {
+	full := bytes.Repeat([]byte("A"), 4096)
+	wrong := bytes.Repeat([]byte("B"), 4096)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(wrong)
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	var out bytes.Buffer
+	_, err := downloadISO(srv.URL+"/kairos.iso", sha256Hex(full), dir, &out)
+	if err == nil {
+		t.Fatal("an ISO that does not match the published checksum was accepted")
+	}
+	if !strings.Contains(err.Error(), sha256Hex(wrong)) {
+		t.Fatalf("error does not name the digest that arrived: %v", err)
+	}
+
+	// Nothing may be left behind, under the target name or the temporary one:
+	// a file at the target path is reported as cached, and a leftover .part
+	// accumulates one per attempt.
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read dir: %v", err)
+	}
+	if len(entries) != 0 {
+		var names []string
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		t.Fatalf("downloads directory holds %v after a rejected download", names)
+	}
+}
+
+// A cached ISO that was corrupted after it landed is caught on the next run
+// and replaced, rather than trusted forever because the file exists.
+func TestCorruptCachedISOIsReplaced(t *testing.T) {
+	full := bytes.Repeat([]byte("A"), 4096)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(full)
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	target := filepath.Join(dir, "kairos.iso")
+	if err := os.WriteFile(target, bytes.Repeat([]byte("B"), 4096), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	path, err := downloadISO(srv.URL+"/kairos.iso", sha256Hex(full), dir, &out)
+	if err != nil {
+		t.Fatalf("download: %v", err)
+	}
+	if strings.Contains(out.String(), "Using cached ISO") {
+		t.Fatalf("the corrupt cached ISO was reported as usable: %q", out.String())
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read iso: %v", err)
+	}
+	if !bytes.Equal(got, full) {
+		t.Fatal("the corrupt cached ISO was not replaced with the published one")
+	}
+}
+
+// A cached ISO that does match is served from disk without re-downloading it.
+func TestVerifiedCachedISOIsReused(t *testing.T) {
+	full := bytes.Repeat([]byte("A"), 4096)
+	var hits int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		_, _ = w.Write(full)
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	target := filepath.Join(dir, "kairos.iso")
+	if err := os.WriteFile(target, full, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	path, err := downloadISO(srv.URL+"/kairos.iso", sha256Hex(full), dir, &out)
+	if err != nil {
+		t.Fatalf("download: %v", err)
+	}
+	if path != target {
+		t.Fatalf("path = %q, want %q", path, target)
+	}
+	if hits != 0 {
+		t.Fatalf("a verified cached ISO was downloaded again (%d requests)", hits)
+	}
+	if !strings.Contains(out.String(), "Using cached ISO") {
+		t.Fatalf("the cached ISO was not named on stdout, got %q", out.String())
+	}
+}
+
+// downloadISO is the only place the bytes are checked, so it must refuse to
+// run at all without a digest rather than fall back to the old behaviour.
+func TestDownloadWithoutAChecksumIsRefused(t *testing.T) {
+	var hits int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		_, _ = w.Write(bytes.Repeat([]byte("A"), 4096))
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	for _, digest := range []string{"", "not-a-digest", strings.Repeat("z", 64)} {
+		var out bytes.Buffer
+		if _, err := downloadISO(srv.URL+"/kairos.iso", digest, dir, &out); err == nil {
+			t.Fatalf("downloaded with %q as the expected sha256", digest)
+		}
+	}
+	if hits != 0 {
+		t.Fatalf("the ISO was fetched %d times before the digest was checked", hits)
+	}
+}
+
+// Dropping a corrupt cached ISO must not wait for the replacement to arrive.
+// SelectDownloaded and SelectOrDownloadISO offer whatever ListDownloaded finds
+// and verify nothing, so a corrupt file left on disk while the re-download
+// fails stays selectable and still boots.
+func TestCorruptCachedISOIsDroppedEvenWhenTheRedownloadFails(t *testing.T) {
+	full := bytes.Repeat([]byte("A"), 4096)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "gone", http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	target := filepath.Join(dir, "kairos.iso")
+	if err := os.WriteFile(target, bytes.Repeat([]byte("B"), 4096), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	if _, err := downloadISO(srv.URL+"/kairos.iso", sha256Hex(full), dir, &out); err == nil {
+		t.Fatal("a failed re-download reported success")
+	}
+
+	isos, err := ListDownloaded(dir)
+	if err != nil {
+		t.Fatalf("ListDownloaded: %v", err)
+	}
+	if len(isos) != 0 {
+		t.Fatalf("ListDownloaded still offers %v, so the corrupt ISO stays selectable", isos)
 	}
 }
