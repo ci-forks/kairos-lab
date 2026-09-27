@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"runtime"
 	"slices"
@@ -4760,5 +4761,130 @@ func TestResetOneVMLeavesASiblingsRecordAlone(t *testing.T) {
 	}
 	if state.FindDiskByName(got, "vm-b") == nil {
 		t.Error("vm-b's disk was removed by a reset that named only vm-a")
+	}
+}
+
+// stubIsWiFiIface answers the Wi-Fi question with a fixed verdict for one
+// test. The real detector stats /sys/class/net on Linux and shells out to
+// networksetup on macOS, so it answers for whatever the suite host is plugged
+// into -- a CI leg on Ethernet and a laptop on Wi-Fi would disagree about
+// whether the caveat is printed, which is the one thing these two tests pin.
+func stubIsWiFiIface(t *testing.T, wifi bool) {
+	t.Helper()
+	saved := isWiFiIface
+	t.Cleanup(func() { isWiFiIface = saved })
+	isWiFiIface = func(string) bool { return wifi }
+}
+
+// A bridged run onto a Wi-Fi radio says so before it starts, on Linux as on
+// macOS (kairos-io/kairos#5021).
+//
+// The warning used to sit inside a `runtime.GOOS == "darwin"` gate, next to
+// the vmnet link check, and vm.IsWiFiIface was hardwired to false off darwin
+// as well -- so both halves had to move for this to print, and restoring
+// either one alone turns this test red.
+//
+// Linux is not the lesser case here, it is the worse one. On macOS the user
+// has usually named the interface; on Linux resolveBridgeUplink takes the
+// first of vm.DetectUplinkCandidates, which reads the default route, so a
+// laptop on Wi-Fi gets the radio enslaved to a bridge without ever having
+// chosen it. The run is allowed either way -- bridging over Wi-Fi works often
+// enough to be worth allowing -- which is why this asserts a line of output
+// and not an error.
+func TestStartWarnsWhenTheBridgedUplinkIsWiFi(t *testing.T) {
+	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
+		t.Skipf("bridged networking has no host side on %s", runtime.GOOS)
+	}
+	t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
+	t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
+	isolateFromHostBinaries(t)
+	seedStartableState(t, "kairos-disk0")
+	stubNetworkPrivilege(t, func(string) error { return nil })
+	stubBridgeIfaceCandidates(t, "kairos-fake-wlan0")
+	stubIsWiFiIface(t, true)
+
+	// Enter at the review, Enter to start, then refuse the privilege prompt,
+	// so the run stops before anything touches the host.
+	var stdout, stderr bytes.Buffer
+	_ = Run([]string{"start", "-name", "kairos-disk0", "-no-iso", "-network", "bridged"},
+		scriptedInput("\n\nn\n"), &stdout, &stderr, "test")
+
+	out := stdout.String()
+	if !strings.Contains(out, "kairos-fake-wlan0 is Wi-Fi") {
+		t.Errorf("a bridged start onto a Wi-Fi interface printed no caveat naming it; stdout:\n%s", out)
+	}
+	if !strings.Contains(out, "may never get a lease") {
+		t.Errorf("the caveat does not say what goes wrong, which is the whole of its value; stdout:\n%s", out)
+	}
+}
+
+// The negative control, and it is not a formality: the cheapest way to make
+// the test above pass is to print the caveat for every bridged run, which
+// would put a paragraph about access points in front of every user on
+// Ethernet. A warning that is always printed is a warning nobody reads.
+func TestStartDoesNotWarnWhenTheBridgedUplinkIsNotWiFi(t *testing.T) {
+	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
+		t.Skipf("bridged networking has no host side on %s", runtime.GOOS)
+	}
+	t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
+	t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
+	isolateFromHostBinaries(t)
+	seedStartableState(t, "kairos-disk0")
+	stubNetworkPrivilege(t, func(string) error { return nil })
+	stubBridgeIfaceCandidates(t, "kairos-fake-uplink0")
+	stubIsWiFiIface(t, false)
+
+	var stdout, stderr bytes.Buffer
+	_ = Run([]string{"start", "-name", "kairos-disk0", "-no-iso", "-network", "bridged"},
+		scriptedInput("\n\nn\n"), &stdout, &stderr, "test")
+
+	if out := stdout.String(); strings.Contains(out, "is Wi-Fi") {
+		t.Errorf("a bridged start onto an Ethernet interface printed the Wi-Fi caveat; stdout:\n%s", out)
+	}
+}
+
+// shared and user attach to no physical interface, so neither can be bridged
+// onto a radio and neither may carry the caveat. shared is the one that
+// matters: it is the DEFAULT mode, it is the mode that works over Wi-Fi
+// precisely because no guest frame leaves the host with a MAC the access
+// point did not see associate, and a caveat there would tell the user the
+// opposite of the truth.
+func TestStartDoesNotWarnAboutWiFiOutsideBridgedMode(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skipf("shared networking is prepared by NetworkManager, which is Linux-only; on %s it is vmnet-shared", runtime.GOOS)
+	}
+	for _, mode := range []string{"shared", "user"} {
+		t.Run(mode, func(t *testing.T) {
+			t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
+			t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
+			isolateFromHostBinaries(t)
+			seedStartableState(t, "kairos-disk0")
+			stubNetworkPrivilege(t, func(string) error { return nil })
+			stubBridgeIfaceCandidates(t, "kairos-fake-wlan0")
+			stubIsWiFiIface(t, true)
+
+			var stdout, stderr bytes.Buffer
+			_ = Run([]string{"start", "-name", "kairos-disk0", "-no-iso", "-network", mode, "-bridge-if", "kairos-fake-wlan0"},
+				scriptedInput("\n\nn\n"), &stdout, &stderr, "test")
+
+			if out := stdout.String(); strings.Contains(out, "is Wi-Fi") {
+				t.Errorf("a %s start printed the Wi-Fi caveat, which describes a bridge it never builds; stdout:\n%s", mode, out)
+			}
+		})
+	}
+}
+
+// The seam has to BE vm.IsWiFiIface, because every test above replaces it.
+// A default that had drifted to a local `return false` -- which is exactly
+// what vm.IsWiFiIface itself was off darwin before kairos-io/kairos#5021 --
+// would leave all three of them green while no real run ever warned.
+//
+// Comparing the function values is what makes that assertable, and it is why
+// the seam is a direct assignment rather than a closure: a closure has its
+// own code pointer, so this comparison could not tell one wrapping
+// vm.IsWiFiIface from one wrapping a constant.
+func TestWiFiSeamIsTheRealDetector(t *testing.T) {
+	if got, want := reflect.ValueOf(isWiFiIface).Pointer(), reflect.ValueOf(vm.IsWiFiIface).Pointer(); got != want {
+		t.Error("the app layer's Wi-Fi seam is not vm.IsWiFiIface, so what a real run asks is not what the tests pin")
 	}
 }
