@@ -1566,6 +1566,30 @@ func isolateFromHostBinaries(t *testing.T) {
 	t.Setenv("PATH", filepath.Join(t.TempDir(), "no-binaries-here"))
 }
 
+// stubFirmwareLookupAway is the companion to isolateFromHostBinaries above,
+// and it is needed by every test that calls it and expects a `start` to reach
+// anything past the firmware precondition.
+//
+// runStart resolves firmware early, before the disk and before the networking
+// block, and on darwin firmwarePathFor takes the macOSFirmwarePath branch
+// unconditionally -- which shells to `brew --prefix qemu`. That is a binary
+// isolateFromHostBinaries has just hidden, so on the macos-latest leg the run
+// ends at "discover qemu brew prefix" with nothing after the config review
+// ever printed. On the ubuntu leg the same test reaches the end of the run,
+// so the whole class of breakage is invisible to a Linux-only check.
+//
+// Reporting a linux/amd64 pair puts firmwarePathFor on its default case,
+// where it looks up no firmware at all. That is the narrowest possible
+// neutralization: firmwareHostPlatform feeds this one decision and nothing
+// else (see its own doc comment), so the network-mode resolution, the sudo
+// prompt and every other read of the host below still see the real darwin.
+func stubFirmwareLookupAway(t *testing.T) {
+	t.Helper()
+	saved := firmwareHostPlatform
+	t.Cleanup(func() { firmwareHostPlatform = saved })
+	firmwareHostPlatform = func() (string, string) { return "linux", "amd64" }
+}
+
 // localISO writes a file that `start -iso` accepts. The resolver checks the
 // extension and stats the path; the contents are never read.
 func localISO(t *testing.T) string {
@@ -1682,17 +1706,11 @@ func TestStartCreatesTheDiskOnceThePrivilegeCheckHasPassed(t *testing.T) {
 	isolateFromHostBinaries(t)
 	seedStartableState(t, "kairos-disk0")
 
-	// This test is about the privilege check, not firmware, but runStart now
-	// resolves firmware as a precondition before disk creation, unconditionally
-	// on darwin. Left unstubbed, firmwareHostPlatform's real body reports the
-	// CI runner's actual GOOS, and on macos-latest that reaches macOSFirmwarePath,
-	// which shells to a real brew isolateFromHostBinaries has hidden -- failing
-	// this run one step earlier than the assertion below expects. Report a pair
-	// that hits firmwarePathFor's default case (no firmware lookup at all), so
-	// the test's own stopping point is unchanged on every host.
-	savedPlatform := firmwareHostPlatform
-	t.Cleanup(func() { firmwareHostPlatform = savedPlatform })
-	firmwareHostPlatform = func() (string, string) { return "linux", "amd64" }
+	// This test is about the privilege check, not firmware, and runStart
+	// resolves firmware as a precondition before disk creation. On macos-latest
+	// that shells to a brew isolateFromHostBinaries has hidden, which would fail
+	// this run one step earlier than the assertion below expects.
+	stubFirmwareLookupAway(t)
 
 	calls := stubNetworkPrivilege(t, func(string) error { return nil })
 
@@ -4813,6 +4831,7 @@ func TestStartWarnsWhenTheBridgedUplinkIsWiFi(t *testing.T) {
 	t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
 	t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
 	isolateFromHostBinaries(t)
+	stubFirmwareLookupAway(t)
 	seedStartableState(t, "kairos-disk0")
 	stubNetworkPrivilege(t, func(string) error { return nil })
 	stubBridgeIfaceCandidates(t, "kairos-fake-wlan0")
@@ -4845,6 +4864,7 @@ func TestStartDoesNotWarnWhenTheBridgedUplinkIsNotWiFi(t *testing.T) {
 	t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
 	t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
 	isolateFromHostBinaries(t)
+	stubFirmwareLookupAway(t)
 	seedStartableState(t, "kairos-disk0")
 	stubNetworkPrivilege(t, func(string) error { return nil })
 	stubBridgeIfaceCandidates(t, "kairos-fake-uplink0")
@@ -4862,14 +4882,24 @@ func TestStartDoesNotWarnWhenTheBridgedUplinkIsNotWiFi(t *testing.T) {
 	// it, and nothing after "[1/3] Preparing networking" is ever written. The
 	// caveat's absence then says nothing at all.
 	//
-	// Every message that validator can produce names the interface, and no
-	// error raised after it does -- the run ends at the sudo prompt on Linux
-	// and at the PATH-isolated qemu launch on macOS -- so this separates
-	// "ran, and did not warn" from "never got there".
-	if err != nil && strings.Contains(err.Error(), "kairos-fake-uplink0") {
-		t.Fatalf("the run was refused at the bridge interface check and never reached the caveat, so its absence proves nothing: %v", err)
+	// Assert on the step banner rather than on the shape of the error, which
+	// is what the first version of this test did -- it matched the interface
+	// name, on the reasoning that every message the validator can produce
+	// names it and nothing raised later does. That was true and still let the
+	// test pass for the wrong reason on macos-latest, where the run died at
+	// "discover qemu brew prefix" two steps earlier and named no interface at
+	// all (see stubFirmwareLookupAway above).
+	//
+	// The banner is printed by runStart immediately before the bridged block
+	// that holds the caveat, so it cannot be reached by a run that stopped
+	// short of it, whatever the run stopped of. An absence assertion is worth
+	// exactly as much as the proof that the run got to where the thing would
+	// have been printed, and this is that proof on every host.
+	out := stdout.String()
+	if !strings.Contains(out, "[1/3] Preparing networking") {
+		t.Fatalf("the run never reached the networking step, so the caveat's absence proves nothing (err: %v); stdout:\n%s", err, out)
 	}
-	if out := stdout.String(); strings.Contains(out, "is Wi-Fi") {
+	if strings.Contains(out, "is Wi-Fi") {
 		t.Errorf("a bridged start onto an Ethernet interface printed the Wi-Fi caveat; stdout:\n%s", out)
 	}
 }
@@ -4890,6 +4920,7 @@ func TestStartRefusesADeadBridgeIfaceBeforeWarningAboutWiFi(t *testing.T) {
 	t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
 	t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
 	isolateFromHostBinaries(t)
+	stubFirmwareLookupAway(t)
 	seedStartableState(t, "kairos-disk0")
 	stubNetworkPrivilege(t, func(string) error { return nil })
 	stubBridgeIfaceCandidates(t, "kairos-fake-wlan0")
