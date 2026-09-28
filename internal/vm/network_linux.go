@@ -840,11 +840,8 @@ func HasStaleNetworkResources(st *state.State) bool {
 	if st.Network.CreatedByKairosLab {
 		return false
 	}
-	bridge := st.Network.BridgeName
-	if bridge == "" {
-		bridge = DefaultBridgeName
-	}
-	return hasStaleBridgeResources(bridge, TapConnNameForIndex(bridge, 0))
+	bridge, _, tapConn := StaleNetworkResourceNames(st)
+	return hasStaleBridgeResources(bridge, tapConn)
 }
 
 // CleanupStaleNetworkResources removes kairos-lab network resources that
@@ -854,11 +851,8 @@ func CleanupStaleNetworkResources(st *state.State) error {
 	if runtime.GOOS != "linux" {
 		return nil
 	}
-	bridge := st.Network.BridgeName
-	if bridge == "" {
-		bridge = DefaultBridgeName
-	}
-	return cleanupNMConnections(bridge, TapNameForIndex(0), TapConnNameForIndex(bridge, 0), false)
+	bridge, tapDevice, tapConn := StaleNetworkResourceNames(st)
+	return cleanupNMConnections(bridge, tapDevice, tapConn, false)
 }
 
 // cleanupNMConnections tears down the bridge, the tap and the NetworkManager
