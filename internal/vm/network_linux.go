@@ -804,15 +804,27 @@ func CleanupLinuxBridge(st *state.State, v state.VM, siblingLive bool) error {
 	}
 	tapDevice := TapNameForIndex(v.Index)
 	tapConn := TapConnNameForIndex(bridgeConn, v.Index)
+
+	// Stamped before the teardown runs, not after it, because the outcome
+	// that needs this recorded is the one that returns early. On a failure
+	// the stored bridge and tap are deliberately kept so the next run can
+	// finish the job, and that retained state is the only thing a later run
+	// reads; without the stamp it says the teardown was never attempted.
+	attemptedAt := state.NowRFC3339()
+	st.Network.LastCleanupAttemptAt = attemptedAt
+
 	if err := cleanupNMConnections(bridgeConn, tapDevice, tapConn, siblingLive); err != nil {
 		return err
 	}
 	if siblingLive {
-		st.Network.LastCleanupAttemptAt = state.NowRFC3339()
 		return nil
 	}
-	st.Network.LastCleanupAttemptAt = state.NowRFC3339()
-	st.Network = state.Network{}
+
+	// The success path clears the network, which is right: nothing kairos-lab
+	// created is on the host any more. The timestamp is not one of those
+	// resources, so it is written back over the zero value rather than being
+	// lost to it.
+	st.Network = state.Network{LastCleanupAttemptAt: attemptedAt}
 	return nil
 }
 
