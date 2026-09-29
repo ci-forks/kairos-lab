@@ -1135,9 +1135,12 @@ func TestGuestAgentIPStopsReadingAtTheResponseCap(t *testing.T) {
 
 	var mu sync.Mutex
 	written := 0
+	var writers sync.WaitGroup
 	qgaDial = func(_ context.Context, _ string) (net.Conn, error) {
 		client, server := net.Pipe()
+		writers.Add(1)
 		go func() {
+			defer writers.Done()
 			defer func() { _ = server.Close() }()
 			if _, err := server.Read(make([]byte, 4096)); err != nil {
 				return
@@ -1169,6 +1172,26 @@ func TestGuestAgentIPStopsReadingAtTheResponseCap(t *testing.T) {
 		}
 	case <-time.After(30 * time.Second):
 		t.Fatal("guestAgentIP never returned: the endpoint sends no LF and the read deadline is a minute away, so only qgaMaxResponse can end this")
+	}
+
+	// The writer adds a chunk to `written` only after its Write returns, and
+	// on a net.Pipe a Write returns once the reader has taken the bytes. The
+	// read that crosses the cap is therefore the read that lets the final
+	// Write return, so guestAgentIP can return -- and the count be read --
+	// before the writer has added that chunk. Nothing else makes the count
+	// final. On one CPU the main goroutine wins that race every time, and the
+	// total comes up exactly one 4096-byte chunk short of the cap.
+	//
+	// guestAgentIP closes the connection on return, which fails the writer's
+	// next Write and ends it, so this wait is bounded. The guard is here so
+	// that a change which stops closing the connection fails the test instead
+	// of hanging it.
+	writersStopped := make(chan struct{})
+	go func() { writers.Wait(); close(writersStopped) }()
+	select {
+	case <-writersStopped:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the endpoint's writer never stopped: guestAgentIP closes the connection on return, which must fail the Write it is blocked in")
 	}
 
 	mu.Lock()
