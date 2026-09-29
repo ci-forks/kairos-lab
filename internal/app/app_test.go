@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"runtime"
 	"slices"
@@ -1565,6 +1566,30 @@ func isolateFromHostBinaries(t *testing.T) {
 	t.Setenv("PATH", filepath.Join(t.TempDir(), "no-binaries-here"))
 }
 
+// stubFirmwareLookupAway is the companion to isolateFromHostBinaries above,
+// and it is needed by every test that calls it and expects a `start` to reach
+// anything past the firmware precondition.
+//
+// runStart resolves firmware early, before the disk and before the networking
+// block, and on darwin firmwarePathFor takes the macOSFirmwarePath branch
+// unconditionally -- which shells to `brew --prefix qemu`. That is a binary
+// isolateFromHostBinaries has just hidden, so on the macos-latest leg the run
+// ends at "discover qemu brew prefix" with nothing after the config review
+// ever printed. On the ubuntu leg the same test reaches the end of the run,
+// so the whole class of breakage is invisible to a Linux-only check.
+//
+// Reporting a linux/amd64 pair puts firmwarePathFor on its default case,
+// where it looks up no firmware at all. That is the narrowest possible
+// neutralization: firmwareHostPlatform feeds this one decision and nothing
+// else (see its own doc comment), so the network-mode resolution, the sudo
+// prompt and every other read of the host below still see the real darwin.
+func stubFirmwareLookupAway(t *testing.T) {
+	t.Helper()
+	saved := firmwareHostPlatform
+	t.Cleanup(func() { firmwareHostPlatform = saved })
+	firmwareHostPlatform = func() (string, string) { return "linux", "amd64" }
+}
+
 // localISO writes a file that `start -iso` accepts. The resolver checks the
 // extension and stats the path; the contents are never read.
 func localISO(t *testing.T) string {
@@ -1681,17 +1706,11 @@ func TestStartCreatesTheDiskOnceThePrivilegeCheckHasPassed(t *testing.T) {
 	isolateFromHostBinaries(t)
 	seedStartableState(t, "kairos-disk0")
 
-	// This test is about the privilege check, not firmware, but runStart now
-	// resolves firmware as a precondition before disk creation, unconditionally
-	// on darwin. Left unstubbed, firmwareHostPlatform's real body reports the
-	// CI runner's actual GOOS, and on macos-latest that reaches macOSFirmwarePath,
-	// which shells to a real brew isolateFromHostBinaries has hidden -- failing
-	// this run one step earlier than the assertion below expects. Report a pair
-	// that hits firmwarePathFor's default case (no firmware lookup at all), so
-	// the test's own stopping point is unchanged on every host.
-	savedPlatform := firmwareHostPlatform
-	t.Cleanup(func() { firmwareHostPlatform = savedPlatform })
-	firmwareHostPlatform = func() (string, string) { return "linux", "amd64" }
+	// This test is about the privilege check, not firmware, and runStart
+	// resolves firmware as a precondition before disk creation. On macos-latest
+	// that shells to a brew isolateFromHostBinaries has hidden, which would fail
+	// this run one step earlier than the assertion below expects.
+	stubFirmwareLookupAway(t)
 
 	calls := stubNetworkPrivilege(t, func(string) error { return nil })
 
@@ -4760,5 +4779,220 @@ func TestResetOneVMLeavesASiblingsRecordAlone(t *testing.T) {
 	}
 	if state.FindDiskByName(got, "vm-b") == nil {
 		t.Error("vm-b's disk was removed by a reset that named only vm-a")
+	}
+}
+
+// stubIsWiFiIface answers the Wi-Fi question with a fixed verdict for one
+// test. The real detector stats /sys/class/net on Linux and shells out to
+// networksetup on macOS, so it answers for whatever the suite host is plugged
+// into -- a CI leg on Ethernet and a laptop on Wi-Fi would disagree about
+// whether the caveat is printed, which is the one thing these two tests pin.
+func stubIsWiFiIface(t *testing.T, wifi bool) {
+	t.Helper()
+	saved := isWiFiIface
+	t.Cleanup(func() { isWiFiIface = saved })
+	isWiFiIface = func(string) bool { return wifi }
+}
+
+// stubValidateBridgeIface answers the host link check with a fixed verdict.
+//
+// Every bridged `start` test below needs this, and on darwin it needs it to
+// get anywhere at all: vm.ValidateBridgeIface is a no-op off darwin, but the
+// darwin one reads `ifconfig -l` and rejects any name that is not on the
+// host, so the run returns at "[1/3] Preparing networking" and prints
+// nothing further. That is why these tests were green on the ubuntu leg and
+// red on the macOS one.
+func stubValidateBridgeIface(t *testing.T, err error) {
+	t.Helper()
+	saved := validateBridgeIface
+	t.Cleanup(func() { validateBridgeIface = saved })
+	validateBridgeIface = func(string) error { return err }
+}
+
+// A bridged run onto a Wi-Fi radio says so before it starts, on Linux as on
+// macOS (kairos-io/kairos#5021).
+//
+// The warning used to sit inside a `runtime.GOOS == "darwin"` gate, next to
+// the vmnet link check, and vm.IsWiFiIface was hardwired to false off darwin
+// as well -- so both halves had to move for this to print, and restoring
+// either one alone turns this test red.
+//
+// Linux is not the lesser case here, it is the worse one. On macOS the user
+// has usually named the interface; on Linux resolveBridgeUplink takes the
+// first of vm.DetectUplinkCandidates, which reads the default route, so a
+// laptop on Wi-Fi gets the radio enslaved to a bridge without ever having
+// chosen it. The run is allowed either way -- bridging over Wi-Fi works often
+// enough to be worth allowing -- which is why this asserts a line of output
+// and not an error.
+func TestStartWarnsWhenTheBridgedUplinkIsWiFi(t *testing.T) {
+	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
+		t.Skipf("bridged networking has no host side on %s", runtime.GOOS)
+	}
+	t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
+	t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
+	isolateFromHostBinaries(t)
+	stubFirmwareLookupAway(t)
+	seedStartableState(t, "kairos-disk0")
+	stubNetworkPrivilege(t, func(string) error { return nil })
+	stubBridgeIfaceCandidates(t, "kairos-fake-wlan0")
+	stubValidateBridgeIface(t, nil)
+	stubIsWiFiIface(t, true)
+
+	// Enter at the review, Enter to start, then refuse the privilege prompt,
+	// so the run stops before anything touches the host.
+	var stdout, stderr bytes.Buffer
+	_ = Run([]string{"start", "-name", "kairos-disk0", "-no-iso", "-network", "bridged"},
+		scriptedInput("\n\nn\n"), &stdout, &stderr, "test")
+
+	out := stdout.String()
+	if !strings.Contains(out, "kairos-fake-wlan0 is Wi-Fi") {
+		t.Errorf("a bridged start onto a Wi-Fi interface printed no caveat naming it; stdout:\n%s", out)
+	}
+	if !strings.Contains(out, "may never get a lease") {
+		t.Errorf("the caveat does not say what goes wrong, which is the whole of its value; stdout:\n%s", out)
+	}
+}
+
+// The negative control, and it is not a formality: the cheapest way to make
+// the test above pass is to print the caveat for every bridged run, which
+// would put a paragraph about access points in front of every user on
+// Ethernet. A warning that is always printed is a warning nobody reads.
+func TestStartDoesNotWarnWhenTheBridgedUplinkIsNotWiFi(t *testing.T) {
+	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
+		t.Skipf("bridged networking has no host side on %s", runtime.GOOS)
+	}
+	t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
+	t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
+	isolateFromHostBinaries(t)
+	stubFirmwareLookupAway(t)
+	seedStartableState(t, "kairos-disk0")
+	stubNetworkPrivilege(t, func(string) error { return nil })
+	stubBridgeIfaceCandidates(t, "kairos-fake-uplink0")
+	stubValidateBridgeIface(t, nil)
+	stubIsWiFiIface(t, false)
+
+	var stdout, stderr bytes.Buffer
+	err := Run([]string{"start", "-name", "kairos-disk0", "-no-iso", "-network", "bridged"},
+		scriptedInput("\n\nn\n"), &stdout, &stderr, "test")
+
+	// An absence assertion is only worth as much as the proof that the run
+	// reached the place the thing would have been printed, and this one very
+	// nearly was not: on darwin the real vm.ValidateBridgeIface above returns
+	// "no such interface kairos-fake-uplink0 on this host", runStart returns
+	// it, and nothing after "[1/3] Preparing networking" is ever written. The
+	// caveat's absence then says nothing at all.
+	//
+	// Assert on the step banner rather than on the shape of the error, which
+	// is what the first version of this test did -- it matched the interface
+	// name, on the reasoning that every message the validator can produce
+	// names it and nothing raised later does. That was true and still let the
+	// test pass for the wrong reason on macos-latest, where the run died at
+	// "discover qemu brew prefix" two steps earlier and named no interface at
+	// all (see stubFirmwareLookupAway above).
+	//
+	// The banner is printed by runStart immediately before the bridged block
+	// that holds the caveat, so it cannot be reached by a run that stopped
+	// short of it, whatever the run stopped of. An absence assertion is worth
+	// exactly as much as the proof that the run got to where the thing would
+	// have been printed, and this is that proof on every host.
+	out := stdout.String()
+	if !strings.Contains(out, "[1/3] Preparing networking") {
+		t.Fatalf("the run never reached the networking step, so the caveat's absence proves nothing (err: %v); stdout:\n%s", err, out)
+	}
+	if strings.Contains(out, "is Wi-Fi") {
+		t.Errorf("a bridged start onto an Ethernet interface printed the Wi-Fi caveat; stdout:\n%s", out)
+	}
+}
+
+// The other half of the seam: a bridge interface the host cannot carry is a
+// refusal, and it comes first, so a run that is about to be rejected does not
+// also lecture the user about access points. The caveat and the refusal live
+// one after the other in the same block and this is what pins their order.
+//
+// It is darwin-only because the carrier check is: vm.ValidateBridgeIface is
+// `return nil` off darwin, and kairos-io/kairos#5021 deliberately left the
+// Linux half of kairos-io/kairos#4431 unbuilt rather than guess at whether
+// NetworkManager will activate a carrier-less ethernet slave.
+func TestStartRefusesADeadBridgeIfaceBeforeWarningAboutWiFi(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skipf("vm.ValidateBridgeIface is a no-op on %s, so there is no refusal to order the caveat against", runtime.GOOS)
+	}
+	t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
+	t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
+	isolateFromHostBinaries(t)
+	stubFirmwareLookupAway(t)
+	seedStartableState(t, "kairos-disk0")
+	stubNetworkPrivilege(t, func(string) error { return nil })
+	stubBridgeIfaceCandidates(t, "kairos-fake-wlan0")
+	stubValidateBridgeIface(t, errors.New("bridge interface kairos-fake-wlan0 is inactive"))
+	// True, so that a caveat printed here could only be one printed ahead of
+	// the refusal rather than one the detector declined to raise.
+	stubIsWiFiIface(t, true)
+
+	var stdout, stderr bytes.Buffer
+	err := Run([]string{"start", "-name", "kairos-disk0", "-no-iso", "-network", "bridged"},
+		scriptedInput("\n\nn\n"), &stdout, &stderr, "test")
+
+	if err == nil || !strings.Contains(err.Error(), "is inactive") {
+		t.Fatalf("start returned %v, want the bridge interface refusal -- the seam is not wired into runStart; stdout:\n%s", err, stdout.String())
+	}
+	if out := stdout.String(); strings.Contains(out, "is Wi-Fi") {
+		t.Errorf("the Wi-Fi caveat was printed for a run that was then refused anyway; stdout:\n%s", out)
+	}
+}
+
+// shared and user attach to no physical interface, so neither can be bridged
+// onto a radio and neither may carry the caveat. shared is the one that
+// matters: it is the DEFAULT mode, it is the mode that works over Wi-Fi
+// precisely because no guest frame leaves the host with a MAC the access
+// point did not see associate, and a caveat there would tell the user the
+// opposite of the truth.
+func TestStartDoesNotWarnAboutWiFiOutsideBridgedMode(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skipf("shared networking is prepared by NetworkManager, which is Linux-only; on %s it is vmnet-shared", runtime.GOOS)
+	}
+	for _, mode := range []string{"shared", "user"} {
+		t.Run(mode, func(t *testing.T) {
+			t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
+			t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
+			isolateFromHostBinaries(t)
+			seedStartableState(t, "kairos-disk0")
+			stubNetworkPrivilege(t, func(string) error { return nil })
+			stubBridgeIfaceCandidates(t, "kairos-fake-wlan0")
+			stubIsWiFiIface(t, true)
+
+			var stdout, stderr bytes.Buffer
+			_ = Run([]string{"start", "-name", "kairos-disk0", "-no-iso", "-network", mode, "-bridge-if", "kairos-fake-wlan0"},
+				scriptedInput("\n\nn\n"), &stdout, &stderr, "test")
+
+			if out := stdout.String(); strings.Contains(out, "is Wi-Fi") {
+				t.Errorf("a %s start printed the Wi-Fi caveat, which describes a bridge it never builds; stdout:\n%s", mode, out)
+			}
+		})
+	}
+}
+
+// The seam has to BE vm.IsWiFiIface, because every test above replaces it.
+// A default that had drifted to a local `return false` -- which is exactly
+// what vm.IsWiFiIface itself was off darwin before kairos-io/kairos#5021 --
+// would leave all three of them green while no real run ever warned.
+//
+// Comparing the function values is what makes that assertable, and it is why
+// the seam is a direct assignment rather than a closure: a closure has its
+// own code pointer, so this comparison could not tell one wrapping
+// vm.IsWiFiIface from one wrapping a constant.
+func TestWiFiSeamIsTheRealDetector(t *testing.T) {
+	if got, want := reflect.ValueOf(isWiFiIface).Pointer(), reflect.ValueOf(vm.IsWiFiIface).Pointer(); got != want {
+		t.Error("the app layer's Wi-Fi seam is not vm.IsWiFiIface, so what a real run asks is not what the tests pin")
+	}
+}
+
+// And the same for the validator beside it, which every bridged test above
+// now replaces. A default that had drifted to `func(string) error { return
+// nil }` would leave them all green while a real macOS run bridged onto a
+// dead port, which is the failure kairos-io/kairos#4431 was filed for.
+func TestBridgeIfaceSeamIsTheRealValidator(t *testing.T) {
+	if got, want := reflect.ValueOf(validateBridgeIface).Pointer(), reflect.ValueOf(vm.ValidateBridgeIface).Pointer(); got != want {
+		t.Error("the app layer's bridge interface seam is not vm.ValidateBridgeIface, so what a real run checks is not what the tests pin")
 	}
 }

@@ -1210,6 +1210,61 @@ var isLinuxBridge = func(name string) bool {
 // further down exists only for a Linux bridge.
 const sysClassNet = "/sys/class/net"
 
+// wirelessDevicePaths returns the two /sys entries whose presence says the
+// named device is a Wi-Fi radio, in the order they are asked about.
+//
+// The paths are out here, in production code a test can call, and not inside
+// isWiFiIface below, for the reason netDevicePath gives: every test swaps the
+// stat seam, so a path built behind it is a path no test ever executes, and
+// the path IS the decision here. /sys/class/net/<name>/type would compile and
+// pass a suite while answering 1 for a Wi-Fi device in managed mode, which is
+// every Wi-Fi device a user bridges.
+//
+// Both entries, because neither alone covers the drivers in use:
+//
+//   - phy80211 is a symlink to the cfg80211 wiphy, added by
+//     wiphy_register/ieee80211_register_hw, so every mac80211 and every
+//     full-MAC cfg80211 driver has it. This is the modern answer.
+//   - wireless is the older WEXT directory, published by net_device's
+//     wireless_handlers. Drivers still shipping only that -- and the ndiswrapper
+//     and vendor out-of-tree modules a user may be on -- have no phy80211.
+//
+// A device that is neither is not a radio, which is the answer an ordinary
+// Ethernet NIC needs.
+func wirelessDevicePaths(name string) []string {
+	device := netDevicePath(name)
+	return []string{
+		filepath.Join(device, "phy80211"),
+		filepath.Join(device, "wireless"),
+	}
+}
+
+// isWiFiIface reports whether the named host interface is a Wi-Fi radio.
+//
+// It is the Linux half of the detector network_notdarwin.go's IsWiFiIface
+// delegates to, and it gates a WARNING and never a refusal, which is what
+// decides how it fails: a stat that cannot be read answers "not Wi-Fi", so an
+// unreadable /sys costs the user a caveat rather than the run. That is the
+// opposite of refusePreexistingBridgePort's fail-closed reading of the same
+// kind of error, and deliberately so -- that one gates a root-run network
+// reconfiguration, this one gates a sentence.
+//
+// statNetDevice is reused rather than given a seam of its own. It holds no
+// decision -- not the path, which is wirelessDevicePaths's above, and not the
+// classification, which is the loop's -- so it is the same stat asked about a
+// different path, which is all a second seam would have been.
+func isWiFiIface(name string) bool {
+	if name == "" {
+		return false
+	}
+	for _, path := range wirelessDevicePaths(name) {
+		if statNetDevice(path) == nil {
+			return true
+		}
+	}
+	return false
+}
+
 // netDevicePath returns the /sys entry whose presence answers "is a device of
 // this name on this host".
 //

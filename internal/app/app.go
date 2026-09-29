@@ -736,14 +736,31 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 	}()
 
 	writeLine(stdout, "[1/3] Preparing networking")
-	if *network == "bridged" && runtime.GOOS == "darwin" {
-		// vmnet happily builds a bridge onto an interface with no link. The
-		// VM then boots, looks healthy, and never gets a lease, so refuse
-		// here instead (kairos-io/kairos#4431).
-		if err := vm.ValidateBridgeIface(networkIface); err != nil {
-			return err
+	if *network == "bridged" {
+		if runtime.GOOS == "darwin" {
+			// vmnet happily builds a bridge onto an interface with no link.
+			// The VM then boots, looks healthy, and never gets a lease, so
+			// refuse here instead (kairos-io/kairos#4431). The carrier
+			// question has no Linux half yet: NetworkManager may refuse to
+			// activate a carrier-less ethernet slave on its own, and until
+			// that is settled a refusal here would be this tool guessing.
+			if err := validateBridgeIface(networkIface); err != nil {
+				return err
+			}
 		}
-		if vm.IsWiFiIface(networkIface) {
+		// The Wi-Fi caveat is not darwin's, though it sat inside the darwin
+		// gate until kairos-io/kairos#5021. An access point drops frames from
+		// a MAC it did not see associate whatever host is bridging onto it,
+		// and on Linux the radio is what a bridged run picks BY DEFAULT:
+		// resolveBridgeUplink takes the first of vm.DetectUplinkCandidates,
+		// which reads the default route, and a laptop's is over Wi-Fi. So the
+		// platform this said nothing on was the one where the user had not
+		// even chosen the interface.
+		//
+		// It stays a warning on both platforms rather than becoming a
+		// refusal: bridging over Wi-Fi works often enough to be worth
+		// allowing, which is the trade wifiBridgeWarning's own doc records.
+		if isWiFiIface(networkIface) {
 			writeLine(stdout, vm.WiFiBridgeWarning(networkIface))
 		}
 	}
@@ -2536,6 +2553,42 @@ func bridgeIfaceLinkNote(iface string) string {
 		return fmt.Sprintf(" (link %s - the VM will not get an address over this interface)", planValue(status))
 	}
 }
+
+// isWiFiIface is vm.IsWiFiIface behind a package-level var, for the reason
+// bridgeIfaceCandidates below gives: the real one stats /sys/class/net on
+// Linux and shells out to networksetup on macOS, so what it answers is
+// whatever the machine running the suite is plugged into. A CI leg on
+// Ethernet and a developer laptop on Wi-Fi would then disagree about whether
+// the caveat is printed, which is the one thing the test needs to pin.
+//
+// It is vm.IsWiFiIface itself and not a closure around it, so that the wiring
+// is assertable: a seam whose default had quietly become a local
+// `func(string) bool { return false }` would leave every test of it green,
+// since each one replaces it. TestWiFiSeamIsTheRealDetector compares the two
+// function values and is what fails then.
+//
+// Nothing in production assigns it; the tests restore it with t.Cleanup.
+var isWiFiIface = vm.IsWiFiIface
+
+// validateBridgeIface is vm.ValidateBridgeIface behind a package-level var,
+// for the same reason isWiFiIface above is one: the darwin implementation
+// asks the host. It reads `ifconfig -l` for the names that exist and
+// `ifconfig <iface>` for the link status, so a name invented by a test is
+// rejected as "no such interface on this host" before the run reaches
+// anything that test wants to pin. Off darwin it returns nil without looking
+// at anything, which is why the gap it left was invisible until a bridged
+// `start` test ran on the macOS leg.
+//
+// The ordering it sits in front of is deliberate and stays: a link that
+// cannot carry a bridge is a refusal, and there is no point warning about
+// the radio on an interface the run is about to reject anyway.
+//
+// It is vm.ValidateBridgeIface itself and not a closure, for the reason
+// TestWiFiSeamIsTheRealDetector gives about the seam next to it, and
+// TestBridgeIfaceSeamIsTheRealValidator asserts the same thing here.
+//
+// Nothing in production assigns it; the tests restore it with t.Cleanup.
+var validateBridgeIface = vm.ValidateBridgeIface
 
 // bridgeIfaceCandidates lists the host interfaces bridged networking can use,
 // most likely first. Linux bridges through a NetworkManager uplink, macOS
