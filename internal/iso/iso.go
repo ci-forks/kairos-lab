@@ -37,7 +37,14 @@ func Download(cfg DownloadConfig) (string, error) {
 		return "", fmt.Errorf("create downloads directory: %w", err)
 	}
 
-	localPath, err := downloadISO(selected.DownloadURL, cfg.DownloadsDir, cfg.Stdout)
+	// Fetch the digest before the ISO: a release with no checksum has to fail
+	// here, not after a multi-gigabyte download that cannot be checked.
+	wantSHA256, err := FetchChecksum(selected)
+	if err != nil {
+		return "", err
+	}
+
+	localPath, err := downloadISO(selected.DownloadURL, wantSHA256, cfg.DownloadsDir, cfg.Stdout)
 	if err != nil {
 		return "", err
 	}
@@ -155,7 +162,11 @@ func SelectOrDownloadISO(downloadsDir string, stdin io.Reader, stdout io.Writer)
 	if err != nil {
 		return "", err
 	}
-	localPath, err := downloadISO(selected.DownloadURL, downloadsDir, stdout)
+	wantSHA256, err := FetchChecksum(selected)
+	if err != nil {
+		return "", err
+	}
+	localPath, err := downloadISO(selected.DownloadURL, wantSHA256, downloadsDir, stdout)
 	if err != nil {
 		return "", err
 	}
@@ -203,7 +214,12 @@ func validateLocalISO(path string) error {
 	return nil
 }
 
-func downloadISO(rawURL, downloadsDir string, stdout io.Writer) (string, error) {
+// downloadISO fetches rawURL into downloadsDir and returns the local path.
+//
+// wantSHA256 is the digest the release publishes for this ISO, lowercase hex,
+// and is required: a downloaded image that nothing checked is the bug this
+// closes (kairos-io/kairos#5009). Callers get it from FetchChecksum.
+func downloadISO(rawURL, wantSHA256, downloadsDir string, stdout io.Writer) (string, error) {
 	u, err := url.Parse(rawURL)
 	if err != nil {
 		return "", fmt.Errorf("parse iso url: %w", err)
@@ -214,12 +230,27 @@ func downloadISO(rawURL, downloadsDir string, stdout io.Writer) (string, error) 
 	if !strings.HasSuffix(strings.ToLower(u.Path), ".iso") {
 		return "", fmt.Errorf("url does not look like an iso: %s", rawURL)
 	}
+	wantSHA256, err = normalizeSHA256(wantSHA256)
+	if err != nil {
+		return "", fmt.Errorf("no usable sha256 to verify %s against: %w", filepath.Base(u.Path), err)
+	}
 
 	base := filepath.Base(u.Path)
 	target := filepath.Join(downloadsDir, base)
 	if _, err := os.Stat(target); err == nil {
-		_, _ = fmt.Fprintf(stdout, "Using cached ISO: %s\n", base)
-		return target, nil
+		// The cache check is an existence check, so a file that was corrupted
+		// after it landed would otherwise be trusted for good. Re-hashing it
+		// costs one pass over a local file and turns that into a re-download.
+		_, _ = fmt.Fprintf(stdout, "Verifying cached ISO: %s\n", base)
+		verifyErr := verifyFileSHA256(target, base, wantSHA256)
+		if verifyErr == nil {
+			_, _ = fmt.Fprintf(stdout, "Using cached ISO: %s\n", base)
+			return target, nil
+		}
+		_, _ = fmt.Fprintf(stdout, "Cached ISO does not match the published checksum, downloading it again (%v)\n", verifyErr)
+		if err := os.Remove(target); err != nil {
+			return "", fmt.Errorf("remove unverified cached iso: %w", err)
+		}
 	}
 
 	_, _ = fmt.Fprintf(stdout, "Downloading %s...\n", base)
@@ -236,14 +267,25 @@ func downloadISO(rawURL, downloadsDir string, stdout io.Writer) (string, error) 
 		return "", fmt.Errorf("download iso: unexpected status %d", resp.StatusCode)
 	}
 
-	f, err := os.Create(target)
+	// Write to a temporary file next to the target and rename only once the
+	// whole body has arrived. The cache check above is a bare os.Stat, so a
+	// partial file at the target path would be served as a complete ISO on
+	// every later run, and the VM would boot a truncated image with nothing
+	// pointing back at the download.
+	f, err := os.CreateTemp(downloadsDir, base+".part-*")
 	if err != nil {
 		return "", fmt.Errorf("create iso file: %w", err)
 	}
+	tmpPath := f.Name()
 	defer func() {
 		_ = f.Close()
+		// Removing the temporary file is a no-op once the rename below has
+		// moved it, and clears it on every error path before that.
+		_ = os.Remove(tmpPath)
 	}()
 
+	// A body that stops short of the announced Content-Length reaches us as an
+	// error from io.Copy, so the copy succeeding is enough to rename on.
 	totalSize := resp.ContentLength
 	if totalSize > 0 {
 		pw := &progressWriter{
@@ -258,6 +300,22 @@ func downloadISO(rawURL, downloadsDir string, stdout io.Writer) (string, error) 
 		if _, err := io.Copy(f, resp.Body); err != nil {
 			return "", fmt.Errorf("write iso file: %w", err)
 		}
+	}
+
+	if err := f.Close(); err != nil {
+		return "", fmt.Errorf("write iso file: %w", err)
+	}
+
+	// Verify before the rename, never after: a file that fails the check must
+	// never occupy the target path, or the next run reports the bad copy as
+	// cached. The deferred os.Remove clears the temporary file from here.
+	_, _ = fmt.Fprintf(stdout, "Verifying %s...\n", base)
+	if err := verifyFileSHA256(tmpPath, base, wantSHA256); err != nil {
+		return "", err
+	}
+
+	if err := os.Rename(tmpPath, target); err != nil {
+		return "", fmt.Errorf("finalize iso file: %w", err)
 	}
 	return target, nil
 }

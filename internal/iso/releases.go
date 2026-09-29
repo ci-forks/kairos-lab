@@ -3,6 +3,7 @@ package iso
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"regexp"
 	"runtime"
@@ -29,6 +30,9 @@ type Asset struct {
 type ISOOption struct {
 	Name        string
 	DownloadURL string
+	// ChecksumURL is the "<Name>.sha256" asset of the same release, empty when
+	// the release does not publish one for this ISO.
+	ChecksumURL string
 	Size        int64
 	Flavor      string // "core" or "standard"
 	Arch        string // "amd64" or "arm64"
@@ -57,6 +61,16 @@ func FetchLatestRelease() (*Release, error) {
 var isoNamePattern = regexp.MustCompile(`^kairos-hadron-[^-]+-(\w+)-(amd64|arm64)-generic-v[\d.]+(-(k3sv[\d.]+\+k3s\d+))?\.iso$`)
 
 func ParseISOAssets(release *Release) []ISOOption {
+	// Every ISO the release publishes ships a "<name>.sha256" next to it. Pair
+	// them up here, while both are still in the same asset list, so the
+	// download has a digest to check against without guessing a URL.
+	checksums := make(map[string]string, len(release.Assets))
+	for _, asset := range release.Assets {
+		if name, ok := strings.CutSuffix(asset.Name, ".sha256"); ok {
+			checksums[name] = asset.BrowserDownloadURL
+		}
+	}
+
 	var options []ISOOption
 	for _, asset := range release.Assets {
 		if !strings.HasSuffix(asset.Name, ".iso") {
@@ -69,6 +83,7 @@ func ParseISOAssets(release *Release) []ISOOption {
 		opt := ISOOption{
 			Name:        asset.Name,
 			DownloadURL: asset.BrowserDownloadURL,
+			ChecksumURL: checksums[asset.Name],
 			Size:        asset.Size,
 			Flavor:      matches[1],
 			Arch:        matches[2],
@@ -77,6 +92,42 @@ func ParseISOAssets(release *Release) []ISOOption {
 		options = append(options, opt)
 	}
 	return options
+}
+
+// FetchChecksum returns the SHA-256 the release publishes for this ISO.
+//
+// A release that publishes no checksum for an ISO is an error rather than a
+// skipped check: the digest is what makes the downloaded image trustworthy,
+// and silently falling back to "whatever arrived" is the behaviour this
+// replaces (kairos-io/kairos#5009).
+func FetchChecksum(opt *ISOOption) (string, error) {
+	if opt.ChecksumURL == "" {
+		return "", fmt.Errorf("the release publishes no .sha256 for %s, so the download cannot be verified", opt.Name)
+	}
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Get(opt.ChecksumURL)
+	if err != nil {
+		return "", fmt.Errorf("fetch checksum for %s: %w", opt.Name, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("fetch checksum for %s: unexpected status %d", opt.Name, resp.StatusCode)
+	}
+
+	// A .sha256 is one short line. Cap the read so a wrong URL cannot stream
+	// an ISO into memory.
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+	if err != nil {
+		return "", fmt.Errorf("read checksum for %s: %w", opt.Name, err)
+	}
+
+	digest, err := parseSHA256Sum(string(body), opt.Name)
+	if err != nil {
+		return "", fmt.Errorf("parse checksum for %s: %w", opt.Name, err)
+	}
+	return digest, nil
 }
 
 func FilterByArch(options []ISOOption, arch string) []ISOOption {
