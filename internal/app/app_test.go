@@ -4996,3 +4996,117 @@ func TestBridgeIfaceSeamIsTheRealValidator(t *testing.T) {
 		t.Error("the app layer's bridge interface seam is not vm.ValidateBridgeIface, so what a real run checks is not what the tests pin")
 	}
 }
+
+// stubStaleNetwork makes the "stale network resources" branch of the reset
+// and cleanup plans the one that runs. See the comment on
+// hasStaleNetworkResources for why a test cannot reach it otherwise.
+func stubStaleNetwork(t *testing.T, stale bool) {
+	t.Helper()
+	saved := hasStaleNetworkResources
+	t.Cleanup(func() { hasStaleNetworkResources = saved })
+	hasStaleNetworkResources = func(_ *state.State) bool { return stale }
+}
+
+// The stale branch resolved nothing. It printed kairoslab0 four times and
+// named no tap at all, while vm.CleanupStaleNetworkResources -- the call the
+// user is consenting to -- reads st.Network.BridgeName and falls back to the
+// default only when it is empty, then deletes the bridge link, the tap link
+// and three connections built from it. A stored bridge therefore had the plan
+// naming interfaces the teardown would not touch, and the teardown deleting
+// interfaces, connections and links the plan never named. Correcting a stored
+// bridge name is not a hypothetical, either: it is what reset's own "reset
+// incomplete" error tells the user to do.
+//
+// The sibling branch a few lines up, the CreatedByKairosLab one, resolves its
+// names and has done since it was written. This asserts the stale branch says
+// what its own teardown will do.
+func TestStalePlanNamesTheResourcesItsCleanupWouldTouch(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("the network plan rows are only printed on linux")
+	}
+	const storedBridge = "mylab0"
+	for _, verb := range []string{"reset", "cleanup"} {
+		t.Run(verb, func(t *testing.T) {
+			t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
+			t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
+			seedInjectedState(t, func(st *state.State) {
+				st.Network.BridgeName = storedBridge
+				// A tap name a removed mode left in the file. The teardown
+				// derives its tap from the VM index and ignores this, so the
+				// plan must ignore it too: naming it would be the same bug
+				// in the other direction.
+				st.Network.TapName = "mylab-vtap9"
+				// What puts the plan on the stale branch rather than the
+				// CreatedByKairosLab one.
+				st.Network.CreatedByKairosLab = false
+			})
+			stubStaleNetwork(t, true)
+
+			var stdout, stderr bytes.Buffer
+			if err := Run([]string{verb, "-dry-run"}, strings.NewReader(""), &stdout, &stderr, "test"); err != nil {
+				t.Fatalf("%s -dry-run: %v", verb, err)
+			}
+			out := stdout.String()
+
+			// Every name cleanupNMConnections builds for index 0 out of the
+			// stored bridge: the bridge link, the tap link, and the three
+			// connections. Every row is matched whole, down to its newline:
+			// a row naming "mylab0-tapX" contains "mylab0-tap", so a
+			// substring check would pass for a name the teardown never
+			// touches.
+			for _, want := range []string{
+				"bridge: " + storedBridge + "\n",
+				"tap: " + vm.TapNameForIndex(0) + "\n",
+				"connections: " + storedBridge + ", " + storedBridge + "-uplink, " + vm.TapConnNameForIndex(storedBridge, 0) + "\n",
+			} {
+				if !strings.Contains(out, want) {
+					t.Errorf("plan does not name %q, which the cleanup would act on; got:\n%s", want, out)
+				}
+			}
+			// And it must not name the default bridge, which this teardown
+			// will leave alone, nor the stored tap, which it never reads.
+			for _, unwanted := range []string{vm.DefaultBridgeName, "mylab-vtap9"} {
+				if strings.Contains(out, unwanted) {
+					t.Errorf("plan names %q, which the cleanup would not touch; got:\n%s", unwanted, out)
+				}
+			}
+		})
+	}
+}
+
+// The names the plan prints and the names the cleanup acts on are now one
+// resolution, vm.StaleNetworkResourceNames, rather than two copies of the
+// same defaulting rule. This pins the rule itself, including the half the
+// stale plan used to get wrong: an empty bridge falls back to the default, a
+// stored one does not, and both tap names follow from whichever bridge won.
+func TestStaleNetworkResourceNamesResolvesStoredNamesThenDefaults(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		bridge, tap string
+		wantBridge  string
+		wantTapConn string
+	}{
+		{"nothing stored", "", "", vm.DefaultBridgeName, vm.DefaultBridgeName + "-tap"},
+		{"a bridge stored", "mylab0", "", "mylab0", "mylab0-tap"},
+		// A tap left by a mode that recorded one. The teardown derives the
+		// tap from the VM index, so a stored tap changes neither name.
+		{"a tap stored too", "mylab0", "mylab-vtap9", "mylab0", "mylab0-tap"},
+		{"only a tap stored", "", "mylab-vtap9", vm.DefaultBridgeName, vm.DefaultBridgeName + "-tap"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st := &state.State{}
+			st.Network.BridgeName = tc.bridge
+			st.Network.TapName = tc.tap
+			bridge, tap, tapConn := vm.StaleNetworkResourceNames(st)
+			if bridge != tc.wantBridge || tapConn != tc.wantTapConn {
+				t.Errorf("got bridge=%q tapConn=%q, want bridge=%q tapConn=%q",
+					bridge, tapConn, tc.wantBridge, tc.wantTapConn)
+			}
+			// The tap DEVICE is index 0's whatever state says, which is what
+			// makes a stored tap unreachable from this path.
+			if tap != vm.TapNameForIndex(0) {
+				t.Errorf("got tap=%q, want index 0's %q", tap, vm.TapNameForIndex(0))
+			}
+		})
+	}
+}

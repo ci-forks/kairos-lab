@@ -359,6 +359,17 @@ var buildQEMUCommand = vm.BuildQEMUCommand
 // decision alone.
 var firmwareHostPlatform = func() (string, string) { return runtime.GOOS, runtime.GOARCH }
 
+// hasStaleNetworkResources is vm.HasStaleNetworkResources behind a seam of
+// the same kind, and it is here because the branch it selects is the one no
+// test could reach. The real function answers "no" off linux, and on the
+// linux CI leg it asks the host whether a bridge link or an nmcli profile of
+// that name exists -- neither of which a test may create. So the plan rows
+// and the teardown call under `else if hasStaleNetwork` were printed and
+// issued by nothing: the branch above them, the one gated on
+// CreatedByKairosLab, is what every existing plan test takes. That is how the
+// two branches came to disagree about which bridge they are talking about.
+var hasStaleNetworkResources = vm.HasStaleNetworkResources
+
 func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *state.Store) error {
 	fs := flag.NewFlagSet("start", flag.ContinueOnError)
 	isoPath := fs.String("iso", "", "path to ISO file")
@@ -1798,7 +1809,7 @@ func runReset(args []string, stdin io.Reader, stdout io.Writer, store *state.Sto
 		}
 	}
 	printRemovalPlan(stdout, "reset", toRemove, toSkip)
-	hasStaleNetwork := vm.HasStaleNetworkResources(st)
+	hasStaleNetwork := hasStaleNetworkResources(st)
 	if runtime.GOOS == "linux" && st.Network.CreatedByKairosLab {
 		// Both names come out of state.json, which anything running as the
 		// user can write, and these rows reach the terminal just above the
@@ -1826,9 +1837,22 @@ func runReset(args []string, stdin io.Reader, stdout io.Writer, store *state.Sto
 		}
 		printList(stdout, "Will clean up network resources", rows)
 	} else if hasStaleNetwork {
+		// The same two stored names the branch above prints, resolved the
+		// same way -- but through vm.StaleNetworkResourceNames, because here
+		// the teardown is vm.CleanupStaleNetworkResources and the rows have
+		// to be what IT will act on. Spelling the default out here instead,
+		// which is what these rows used to do, made the plan name a bridge
+		// and three connections the teardown would leave alone while it went
+		// and deleted the stored ones. The tap row is new for the same
+		// reason: the teardown runs `ip link delete` on it.
+		//
+		// planValue still does the escaping, via printList, exactly as it
+		// does for the rows above; see the comment there.
+		staleBridge, staleTap, staleTapConn := vm.StaleNetworkResourceNames(st)
 		printList(stdout, "Will clean up stale network resources (from failed/interrupted setup)", []string{
-			"bridge: " + vm.DefaultBridgeName,
-			"connections: " + vm.DefaultBridgeName + ", " + vm.DefaultBridgeName + "-uplink, " + vm.DefaultBridgeName + "-tap",
+			"bridge: " + staleBridge,
+			"tap: " + staleTap,
+			"connections: " + staleBridge + ", " + staleBridge + "-uplink, " + staleTapConn,
 		})
 	}
 
@@ -1958,7 +1982,7 @@ func runCleanup(args []string, stdin io.Reader, stdout io.Writer, store *state.S
 	printList(stdout, "Will uninstall dependencies", pkgRemovals)
 	printList(stdout, "Will keep dependencies (pre-existing)", st.Setup.PreExistingDeps)
 
-	hasStaleNetwork := vm.HasStaleNetworkResources(st)
+	hasStaleNetwork := hasStaleNetworkResources(st)
 	if runtime.GOOS == "linux" && st.Network.CreatedByKairosLab {
 		// Both names come out of state.json, which anything running as the
 		// user can write, and these rows reach the terminal just above the
@@ -1980,9 +2004,22 @@ func runCleanup(args []string, stdin io.Reader, stdout io.Writer, store *state.S
 		}
 		printList(stdout, "Will clean up network resources", rows)
 	} else if hasStaleNetwork {
+		// The same two stored names the branch above prints, resolved the
+		// same way -- but through vm.StaleNetworkResourceNames, because here
+		// the teardown is vm.CleanupStaleNetworkResources and the rows have
+		// to be what IT will act on. Spelling the default out here instead,
+		// which is what these rows used to do, made the plan name a bridge
+		// and three connections the teardown would leave alone while it went
+		// and deleted the stored ones. The tap row is new for the same
+		// reason: the teardown runs `ip link delete` on it.
+		//
+		// planValue still does the escaping, via printList, exactly as it
+		// does for the rows above; see the comment there.
+		staleBridge, staleTap, staleTapConn := vm.StaleNetworkResourceNames(st)
 		printList(stdout, "Will clean up stale network resources (from failed/interrupted setup)", []string{
-			"bridge: " + vm.DefaultBridgeName,
-			"connections: " + vm.DefaultBridgeName + ", " + vm.DefaultBridgeName + "-uplink, " + vm.DefaultBridgeName + "-tap",
+			"bridge: " + staleBridge,
+			"tap: " + staleTap,
+			"connections: " + staleBridge + ", " + staleBridge + "-uplink, " + staleTapConn,
 		})
 	}
 
