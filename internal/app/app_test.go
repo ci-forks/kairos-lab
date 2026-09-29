@@ -5077,24 +5077,36 @@ func TestStalePlanNamesTheResourcesItsCleanupWouldTouch(t *testing.T) {
 // The names the plan prints and the names the cleanup acts on are now one
 // resolution, vm.StaleNetworkResourceNames, rather than two copies of the
 // same defaulting rule. This pins the rule itself, including the half the
-// stale plan used to get wrong: an empty bridge falls back to the default, a
-// stored one does not, and both tap names follow from whichever bridge won.
+// stale plan used to get wrong: a stored bridge wins only when the recorded
+// mode is one that builds a bridge of its own, anything else falls back to
+// the default, and both tap names follow from whichever bridge won.
 func TestStaleNetworkResourceNamesResolvesStoredNamesThenDefaults(t *testing.T) {
 	for _, tc := range []struct {
-		name        string
-		bridge, tap string
-		wantBridge  string
-		wantTapConn string
+		name              string
+		mode, bridge, tap string
+		wantBridge        string
+		wantTapConn       string
 	}{
-		{"nothing stored", "", "", vm.DefaultBridgeName, vm.DefaultBridgeName + "-tap"},
-		{"a bridge stored", "mylab0", "", "mylab0", "mylab0-tap"},
+		{"nothing stored", "shared", "", "", vm.DefaultBridgeName, vm.DefaultBridgeName + "-tap"},
+		{"a bridge stored", "shared", "mylab0", "", "mylab0", "mylab0-tap"},
+		{"a bridge stored by the bridged mode", "bridged", "mylab0", "", "mylab0", "mylab0-tap"},
 		// A tap left by a mode that recorded one. The teardown derives the
 		// tap from the VM index, so a stored tap changes neither name.
-		{"a tap stored too", "mylab0", "mylab-vtap9", "mylab0", "mylab0-tap"},
-		{"only a tap stored", "", "mylab-vtap9", vm.DefaultBridgeName, vm.DefaultBridgeName + "-tap"},
+		{"a tap stored too", "shared", "mylab0", "mylab-vtap9", "mylab0", "mylab0-tap"},
+		{"only a tap stored", "shared", "", "mylab-vtap9", vm.DefaultBridgeName, vm.DefaultBridgeName + "-tap"},
+		// The reason the rule asks about the mode at all. `--network virbr`
+		// is gone, but the state.json it wrote records libvirt's own bridge
+		// in the same field the surviving modes read back and then delete.
+		// Resolving it here would have this cleanup take libvirt's default
+		// network down for every VM on the host.
+		{"a virbr bridge is not ours to name", "virbr", "virbr0", "vnet3", vm.DefaultBridgeName, vm.DefaultBridgeName + "-tap"},
+		// And an unset mode is not a claim of ownership either: it is what
+		// a state file written before the field existed looks like.
+		{"no mode recorded", "", "virbr0", "", vm.DefaultBridgeName, vm.DefaultBridgeName + "-tap"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			st := &state.State{}
+			st.Network.Mode = tc.mode
 			st.Network.BridgeName = tc.bridge
 			st.Network.TapName = tc.tap
 			bridge, tap, tapConn := vm.StaleNetworkResourceNames(st)

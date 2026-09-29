@@ -20,26 +20,31 @@ const (
 )
 
 // resolveLinuxBridgeName resolves and validates the host-level bridge name --
-// st.Network.BridgeName, or DefaultBridgeName when unset. Unlike the tap, the
-// bridge is not per-VM -- every VM in this config dir shares one bridge and
-// gets its own tap on it -- so it is resolved once, before either
-// PrepareLinuxBridge or PrepareLinuxShared can compute this VM's own tap
-// connection name (TapConnNameForIndex takes the bridge as an argument).
+// managedBridgeName's answer for this state. It is resolved once, before
+// either PrepareLinuxBridge or PrepareLinuxShared can compute this VM's own
+// tap connection name (TapConnNameForIndex takes the bridge as an argument).
+//
+// What is validated is what is STORED, not what managedBridgeName goes on to
+// resolve. A malformed name is a malformed name whatever mode recorded it, and
+// the two questions are separate: whether a value is safe to hand to root, and
+// whether this run is the one that owns it. Ask only the second and a name
+// this run ignores stays in the file unexamined until the mode that does use
+// it reads it back. An empty field is "nothing was recorded" rather than a
+// name of no length; it resolves to a compiled-in default that needs no
+// checking, and the validator would reject it.
+//
+// The stored name is about to be interpolated into root-run nmcli and ip
+// commands, into a filesystem path and into the cleanup plan the user is asked
+// to confirm. A rejected name is an error and not a quiet fall back to the
+// default: a value someone put in state.json that silently does nothing is its
+// own surprise.
 func resolveLinuxBridgeName(st *state.State) (string, error) {
-	bridge := st.Network.BridgeName
-	if bridge == "" {
-		bridge = DefaultBridgeName
+	if st.Network.BridgeName != "" {
+		if err := validateStoredInterfaceName("bridge name", st.Network.BridgeName); err != nil {
+			return "", err
+		}
 	}
-	// This name was just read out of state.json, and is about to be
-	// interpolated into root-run nmcli and ip commands, into a filesystem
-	// path and into the cleanup plan the user is asked to confirm. A
-	// rejected name is an error and not a quiet fall back to the default: a
-	// value someone put in state.json that silently does nothing is its own
-	// surprise.
-	if err := validateStoredInterfaceName("bridge name", bridge); err != nil {
-		return "", err
-	}
-	return bridge, nil
+	return managedBridgeName(st.Network), nil
 }
 
 // linuxNetworkPreflight performs the host-side checks PrepareLinuxBridge and
@@ -798,10 +803,7 @@ func CleanupLinuxBridge(st *state.State, v state.VM, siblingLive bool) error {
 	if !st.Network.CreatedByKairosLab {
 		return nil
 	}
-	bridgeConn := st.Network.BridgeName
-	if bridgeConn == "" {
-		bridgeConn = DefaultBridgeName
-	}
+	bridgeConn := managedBridgeName(st.Network)
 	tapDevice := TapNameForIndex(v.Index)
 	tapConn := TapConnNameForIndex(bridgeConn, v.Index)
 
