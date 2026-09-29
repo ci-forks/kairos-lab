@@ -158,7 +158,7 @@ func SelectOrDownloadISO(downloadsDir string, stdin io.Reader, stdout io.Writer)
 	if err := os.MkdirAll(downloadsDir, 0o755); err != nil {
 		return "", fmt.Errorf("create downloads directory: %w", err)
 	}
-	selected, err := interactivePicker(stdin, stdout)
+	selected, err := interactivePicker(reader, stdout)
 	if err != nil {
 		return "", err
 	}

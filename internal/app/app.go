@@ -34,6 +34,20 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer, version strin
 		printUsage(stdout)
 		return nil
 	}
+	// Buffer the process stdin once, here, so that every prompt the chosen
+	// subcommand opens shares one buffer.
+	//
+	// A bufio.Reader fills its whole buffer on the first Read, and stdin
+	// returns one line per Read only when it is a terminal in canonical mode.
+	// Under `printf '7\nshared\n\n' | kairos-lab start`, a heredoc or a
+	// redirected file, the first prompt to wrap stdin for itself takes every
+	// later answer into its buffer and drops them when it returns, and the
+	// next prompt fails with "no input" (kairos-io/kairos#5057).
+	//
+	// Wrapping here is what fixes that: bufio.NewReader hands back the reader
+	// it is given when that is already a *bufio.Reader of at least the same
+	// size, so the prompts below keep calling it and keep getting this one.
+	stdin = bufio.NewReader(stdin)
 	store, err := state.DefaultStore()
 	if err != nil {
 		return err
@@ -267,14 +281,14 @@ func selectOrCreateDisk(st *state.State, vmDir, downloadsDir, diskSize string, s
 
 	if choice == "n" || choice == "new" {
 		writeLine(stdout, "")
-		res, err := iso.ResolveForStart("", downloadsDir, stdin, stdout)
+		res, err := iso.ResolveForStart("", downloadsDir, reader, stdout)
 		if err != nil {
 			return nil, "", false, err
 		}
 		isoPath := res.LocalPath
 		isoBaseName := strings.TrimSuffix(filepath.Base(isoPath), ".iso")
 		suggestedName := fmt.Sprintf("%s-%s", isoBaseName, state.NowTimestamp())
-		diskName, err := promptDiskName(suggestedName, diskNameSet(st), stdin, stdout)
+		diskName, err := promptDiskName(suggestedName, diskNameSet(st), reader, stdout)
 		if err != nil {
 			return nil, "", false, err
 		}
@@ -2246,6 +2260,13 @@ func reviewVMConfig(cfg *vmStartConfig, stdin io.Reader, stdout io.Writer) (*vmS
 		ramHint = fmt.Sprintf("  (%d GB available)", ramGB)
 	}
 
+	// One reader for the whole review, and for every sub-prompt it opens.
+	// Buffering one per pass drops whatever the menu read ahead of, which is
+	// every later answer as soon as stdin is a pipe rather than a terminal.
+	// Run already wrapped the process stdin, so this is a no-op there and
+	// only does the wrapping for a caller that passes an unbuffered reader.
+	reader := bufio.NewReader(stdin)
+
 	for {
 		writeLine(stdout, "")
 		diskFreeGB := freeSpaceGB(filepath.Dir(cfg.DiskPath))
@@ -2274,7 +2295,6 @@ func reviewVMConfig(cfg *vmStartConfig, stdin io.Reader, stdout io.Writer) (*vmS
 		writeLine(stdout, "")
 		writef(stdout, "Press Enter to continue, or enter a number to edit: ")
 
-		reader := bufio.NewReader(stdin)
 		line, err := reader.ReadString('\n')
 		if err != nil {
 			return nil, fmt.Errorf("cancelled")
@@ -2297,7 +2317,7 @@ func reviewVMConfig(cfg *vmStartConfig, stdin io.Reader, stdout io.Writer) (*vmS
 				writeLine(stdout, "(disk name cannot be changed for an existing disk)")
 				break
 			}
-			val, err := prompt(stdin, stdout, "Enter disk name")
+			val, err := prompt(reader, stdout, "Enter disk name")
 			if err != nil {
 				return nil, err
 			}
@@ -2321,7 +2341,7 @@ func reviewVMConfig(cfg *vmStartConfig, stdin io.Reader, stdout io.Writer) (*vmS
 			writeLine(stdout, "(disk path is derived from the disk name — change the name to update the path)")
 		case 3:
 			if cfg.IsNewDisk {
-				val, err := prompt(stdin, stdout, "Enter disk size in GB (e.g., 20, 60)")
+				val, err := prompt(reader, stdout, "Enter disk size in GB (e.g., 20, 60)")
 				if err != nil {
 					return nil, err
 				}
@@ -2336,7 +2356,7 @@ func reviewVMConfig(cfg *vmStartConfig, stdin io.Reader, stdout io.Writer) (*vmS
 			} else {
 				writeLine(stdout, "Warning: changing disk size will delete and recreate the disk image.")
 				writeLine(stdout, "Any existing data on the disk will be lost.")
-				ok, err := confirm(stdin, stdout, false, "I understand and want to change the disk size")
+				ok, err := confirm(reader, stdout, false, "I understand and want to change the disk size")
 				if err != nil {
 					return nil, err
 				}
@@ -2344,7 +2364,7 @@ func reviewVMConfig(cfg *vmStartConfig, stdin io.Reader, stdout io.Writer) (*vmS
 					writeLine(stdout, "Cancelled.")
 					break
 				}
-				val, err := prompt(stdin, stdout, "Enter new disk size in GB (e.g., 20, 60)")
+				val, err := prompt(reader, stdout, "Enter new disk size in GB (e.g., 20, 60)")
 				if err != nil {
 					return nil, err
 				}
@@ -2366,7 +2386,7 @@ func reviewVMConfig(cfg *vmStartConfig, stdin io.Reader, stdout io.Writer) (*vmS
 				cfg.ISOPath = selectedISO
 			}
 		case 5:
-			val, err := prompt(stdin, stdout, "Enter memory in GB (e.g., 4, 8)")
+			val, err := prompt(reader, stdout, "Enter memory in GB (e.g., 4, 8)")
 			if err != nil {
 				return nil, err
 			}
@@ -2379,7 +2399,7 @@ func reviewVMConfig(cfg *vmStartConfig, stdin io.Reader, stdout io.Writer) (*vmS
 				}
 			}
 		case 6:
-			val, err := prompt(stdin, stdout, "Enter number of CPUs (e.g., 2, 4)")
+			val, err := prompt(reader, stdout, "Enter number of CPUs (e.g., 2, 4)")
 			if err != nil {
 				return nil, err
 			}
@@ -2392,7 +2412,7 @@ func reviewVMConfig(cfg *vmStartConfig, stdin io.Reader, stdout io.Writer) (*vmS
 				}
 			}
 		case 7:
-			val, err := prompt(stdin, stdout, "Enter network mode (shared, bridged or user)")
+			val, err := prompt(reader, stdout, "Enter network mode (shared, bridged or user)")
 			if err != nil {
 				return nil, err
 			}
@@ -2431,7 +2451,7 @@ func reviewVMConfig(cfg *vmStartConfig, stdin io.Reader, stdout io.Writer) (*vmS
 					for i, iface := range candidates {
 						writef(stdout, "  %d) %s\n", i+1, iface)
 					}
-					val, err := prompt(stdin, stdout, fmt.Sprintf("Select interface [1-%d]", len(candidates)))
+					val, err := prompt(reader, stdout, fmt.Sprintf("Select interface [1-%d]", len(candidates)))
 					if err != nil {
 						return nil, err
 					}
@@ -2442,7 +2462,7 @@ func reviewVMConfig(cfg *vmStartConfig, stdin io.Reader, stdout io.Writer) (*vmS
 						writeLine(stdout, "Invalid selection")
 					}
 				} else {
-					val, err := prompt(stdin, stdout, "Enter interface name")
+					val, err := prompt(reader, stdout, "Enter interface name")
 					if err != nil {
 						return nil, err
 					}
@@ -2454,7 +2474,7 @@ func reviewVMConfig(cfg *vmStartConfig, stdin io.Reader, stdout io.Writer) (*vmS
 				writeLine(stdout, "Invalid option (a network interface applies to bridged mode only, on Linux and macOS; shared mode attaches to no host interface)")
 			}
 		case 9:
-			val, err := prompt(stdin, stdout, "Enter display mode (window or serial)")
+			val, err := prompt(reader, stdout, "Enter display mode (window or serial)")
 			if err != nil {
 				return nil, err
 			}

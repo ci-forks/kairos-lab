@@ -1,6 +1,7 @@
 package app
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
@@ -3099,15 +3100,16 @@ func reviewableConfig(t *testing.T) *vmStartConfig {
 // scriptedInput hands back one line per Read, the way a terminal in canonical
 // mode does.
 //
-// A plain strings.Reader cannot drive reviewVMConfig: the function builds a
-// fresh bufio.Reader for the menu on every iteration and prompt() builds
-// another for every sub-prompt, and each of those fills its 4 KiB buffer from
-// the first Read. A strings.Reader answers that with the WHOLE script, so the
-// first bufio.Reader swallows every remaining line and then goes out of scope
-// with them still in its buffer; the next prompt sees EOF and the reviewer
-// returns "no input" instead of processing line two. Reading a line at a time
-// is both what a tty actually does and the only way these tests exercise the
-// menu rather than the cancel path.
+// It used to be the ONLY reader that could drive reviewVMConfig: the menu
+// rebuilt a bufio.Reader every iteration and prompt() built another for every
+// sub-prompt, so a reader that answered the first Read with the whole script
+// lost every line but the first, and the reviewer returned "no input". That
+// was kairos-io/kairos#5057, and a plain strings.Reader drives these paths
+// now; the specs named ...FromPipedStdin are the ones that hold it fixed.
+//
+// This helper stays because a tty is still worth covering in its own right:
+// it is the shape real interactive use has, and it is what the specs below
+// were written against.
 func scriptedInput(script string) io.Reader {
 	lines := strings.SplitAfter(script, "\n")
 	out := make([]string, 0, len(lines))
@@ -5108,5 +5110,164 @@ func TestStaleNetworkResourceNamesResolvesStoredNamesThenDefaults(t *testing.T) 
 				t.Errorf("got tap=%q, want index 0's %q", tap, vm.TapNameForIndex(0))
 			}
 		})
+	}
+}
+
+// A pipe, a heredoc and a redirected file all hand back as much as is ready
+// rather than one line per Read, and that is what broke kairos-io/kairos#5057:
+// the review menu buffered the whole script, used line one, and every prompt
+// after it read EOF. strings.Reader has exactly that behaviour, so these
+// specs fail against a reviewer that buffers more than once.
+func TestReviewVMConfigTakesEveryAnswerFromPipedStdin(t *testing.T) {
+	cfg := reviewableConfig(t)
+	var stdout bytes.Buffer
+
+	got, err := reviewVMConfig(cfg, strings.NewReader("5\n8\n\n"), &stdout)
+	if err != nil {
+		t.Fatalf("reviewVMConfig on piped stdin: %v", err)
+	}
+	if got.MemoryGB != 8 {
+		t.Fatalf("memory: got %d GB, want 8 GB", got.MemoryGB)
+	}
+}
+
+// Several edits in one script: the failure only showed from the second prompt
+// onwards, so one edit is not enough to pin it.
+func TestReviewVMConfigTakesSeveralEditsFromPipedStdin(t *testing.T) {
+	cfg := reviewableConfig(t)
+	var stdout bytes.Buffer
+
+	got, err := reviewVMConfig(cfg, strings.NewReader("5\n8\n6\n4\n7\nshared\n\n"), &stdout)
+	if err != nil {
+		t.Fatalf("reviewVMConfig on piped stdin: %v", err)
+	}
+	if got.MemoryGB != 8 {
+		t.Fatalf("memory: got %d GB, want 8 GB", got.MemoryGB)
+	}
+	if got.CPUs != 4 {
+		t.Fatalf("cpus: got %d, want 4", got.CPUs)
+	}
+	if got.NetworkMode != "shared" {
+		t.Fatalf("network mode: got %q, want %q", got.NetworkMode, "shared")
+	}
+}
+
+// promptDiskName re-prompts on a rejected name, so it reads twice from the
+// reader it was given and must not lose the second line either.
+func TestPromptDiskNameRePromptsFromPipedStdin(t *testing.T) {
+	var stdout bytes.Buffer
+	taken := map[string]struct{}{"kairos-disk0": {}}
+
+	got, err := promptDiskName("kairos-disk0", taken, strings.NewReader("kairos-disk0\nkairos-disk1\n"), &stdout)
+	if err != nil {
+		t.Fatalf("promptDiskName on piped stdin: %v", err)
+	}
+	if got != "kairos-disk1" {
+		t.Fatalf("got %q, want %q", got, "kairos-disk1")
+	}
+	if !strings.Contains(stdout.String(), "already exists") {
+		t.Fatalf("expected the taken-name rejection to be printed, got:\n%s", stdout.String())
+	}
+}
+
+// The end-to-end shape of kairos-io/kairos#5057: the whole command driven the
+// way a script drives it, `printf '7\nshared\n\n' | kairos-lab start ...`,
+// with stdin handing back more than one line per Read. Before Run buffered
+// stdin once, this failed at the network-mode prompt with "no input" and the
+// pre-flight was never reached.
+func TestStartTakesTheReviewAnswersFromPipedStdin(t *testing.T) {
+	t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
+	t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
+	isolateFromHostBinaries(t)
+	seedStartableState(t, "kairos-disk0")
+
+	refused := errors.New("this host cannot privilege the mode")
+	calls := stubNetworkPrivilege(t, func(string) error { return refused })
+
+	var stdout, stderr bytes.Buffer
+	err := Run([]string{"start", "-name", "kairos-disk0", "-no-iso", "-network", "user"},
+		strings.NewReader("7\nshared\n\n"), &stdout, &stderr, "test")
+
+	if !errors.Is(err, refused) {
+		t.Fatalf("start returned %v, want the pre-flight's own refusal; stdout:\n%s", err, stdout.String())
+	}
+	if want := []string{"shared"}; !slices.Equal(*calls, want) {
+		t.Fatalf("the pre-flight was asked %q, want %q", *calls, want)
+	}
+}
+
+// The three prompts of the "create a new disk" path live in two packages:
+// selectOrCreateDisk asks which disk, iso.SelectDownloaded asks which image,
+// and promptDiskName asks for the name. Each used to buffer stdin for itself,
+// so the disk picker swallowed the two answers meant for the other two. This
+// is the cross-package half of kairos-io/kairos#5057.
+func TestSelectOrCreateDiskCarriesPipedStdinAcrossPackages(t *testing.T) {
+	store := &state.Store{CacheDir: t.TempDir(), ConfigDir: t.TempDir()}
+	st := state.NewState(store)
+	st.Disks = append(st.Disks, state.Disk{Name: "kairos-disk0", Path: "/tmp/kairos-disk0.qcow2", Size: "60G"})
+
+	// Two ISOs, so the image picker asks rather than taking the only one.
+	downloads := t.TempDir()
+	for _, name := range []string{"kairos-a.iso", "kairos-b.iso"} {
+		if err := os.WriteFile(filepath.Join(downloads, name), []byte("iso"), 0o600); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+
+	var stdout bytes.Buffer
+	// n -> create new, 2 -> the second ISO, then the disk name.
+	disk, isoLocal, isNew, err := selectOrCreateDisk(st, t.TempDir(), downloads, "60G",
+		strings.NewReader("n\n2\nkairos-disk1\n"), &stdout)
+	if err != nil {
+		t.Fatalf("selectOrCreateDisk on piped stdin: %v\nstdout:\n%s", err, stdout.String())
+	}
+	if !isNew {
+		t.Fatal("expected a new disk")
+	}
+	if disk.Name != "kairos-disk1" {
+		t.Fatalf("disk name: got %q, want %q", disk.Name, "kairos-disk1")
+	}
+	if filepath.Base(isoLocal) != "kairos-b.iso" {
+		t.Fatalf("iso: got %q, want kairos-b.iso", isoLocal)
+	}
+}
+
+// Threading one reader through the prompts only works because the nested
+// bufio.NewReader calls are no-ops on a reader that is already buffered.
+// That is bufio.NewReaderSize's documented reuse, and it is load-bearing
+// here: if it ever stopped holding, every prompt below Run would go back to
+// owning a buffer and kairos-io/kairos#5057 would return. Pin it.
+func TestBufioNewReaderReusesAnAlreadyBufferedReader(t *testing.T) {
+	first := bufio.NewReader(strings.NewReader("one\ntwo\n"))
+	if second := bufio.NewReader(first); second != first {
+		t.Fatalf("bufio.NewReader wrapped a *bufio.Reader again: got %p, want %p", second, first)
+	}
+}
+
+// Two prompting functions in a row, which is what makes the single wrap in
+// Run load-bearing rather than a tidy-up: runStart calls selectOrCreateDisk
+// to pick the disk and reviewVMConfig to settle the config, and each of them
+// buffers what it is handed. Only Run buffering the process stdin first makes
+// those two share a reader, so the disk picker cannot swallow the review's
+// answers on the way past.
+func TestStartSharesOneStdinBetweenTheDiskPickerAndTheReview(t *testing.T) {
+	t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
+	t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
+	isolateFromHostBinaries(t)
+	seedStartableState(t, "kairos-disk0")
+
+	refused := errors.New("this host cannot privilege the mode")
+	calls := stubNetworkPrivilege(t, func(string) error { return refused })
+
+	// 1 -> the seeded disk, then 7 -> shared at the review, then leave.
+	var stdout, stderr bytes.Buffer
+	err := Run([]string{"start", "-no-iso", "-network", "user"},
+		strings.NewReader("1\n7\nshared\n\n"), &stdout, &stderr, "test")
+
+	if !errors.Is(err, refused) {
+		t.Fatalf("start returned %v, want the pre-flight's own refusal; stdout:\n%s", err, stdout.String())
+	}
+	if want := []string{"shared"}; !slices.Equal(*calls, want) {
+		t.Fatalf("the pre-flight was asked %q, want %q", *calls, want)
 	}
 }
