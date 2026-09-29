@@ -2636,3 +2636,110 @@ func TestPrepareLinuxSharedPortListReadCount(t *testing.T) {
 		}
 	})
 }
+
+// last_cleanup_attempt_at answers "was a teardown attempted, and when". Both
+// outcomes used to lose it: the success path assigned it and then replaced the
+// whole Network struct with its zero value on the next line, and the failure
+// path returned before the assignment ran.
+//
+// The failure arm is the one that matters. `reset` and `cleanup` keep the
+// stored bridge and tap when the teardown fails, so the user can retry, and
+// that retained state is the only record a later run has. An empty stamp
+// beside a kept bridge name says kairos-lab prepared the network and never
+// tried to remove it, which is the opposite of what happened.
+func TestCleanupLinuxBridgeRecordsWhenTheTeardownWasAttempted(t *testing.T) {
+	// A shared run's leftovers, the shape TestCleanupNMConnections... uses.
+	staleSharedState := func() *state.State {
+		st := &state.State{}
+		st.Network.Mode = "shared"
+		st.Network.CreatedByKairosLab = true
+		st.Network.BridgeName = DefaultBridgeName
+		st.Network.TapName = DefaultTapName
+		return st
+	}
+
+	t.Run("a teardown that finished", func(t *testing.T) {
+		h := newFakeHost(t)
+		h.conns[DefaultBridgeName] = true
+		h.conns[DefaultBridgeName+"-tap"] = true
+		h.bridges[DefaultBridgeName] = true
+		h.links[DefaultTapName] = true
+		h.slaves[DefaultBridgeName] = []string{DefaultTapName}
+
+		st := staleSharedState()
+		if err := CleanupLinuxBridge(st, state.VM{}, false); err != nil {
+			t.Fatalf("an ordinary shared teardown reported failure: %v", err)
+		}
+		if st.Network.LastCleanupAttemptAt == "" {
+			t.Error("LastCleanupAttemptAt is empty after a teardown that finished")
+		}
+		// The rest of the network is still cleared. The timestamp is a record
+		// of what kairos-lab did, not one of the resources it removed, so
+		// keeping it must not keep anything else.
+		if st.Network.Mode != "" || st.Network.BridgeName != "" || st.Network.TapName != "" || st.Network.CreatedByKairosLab {
+			t.Errorf("the network was not cleared after a finished teardown: %+v", st.Network)
+		}
+	})
+
+	t.Run("a teardown that failed", func(t *testing.T) {
+		h := newFakeHost(t)
+		h.conns[DefaultBridgeName] = true
+		h.bridges[DefaultBridgeName] = true
+		h.failCmd = func(argv []string) error { return fmt.Errorf("exit status 10") }
+
+		st := staleSharedState()
+		if err := CleanupLinuxBridge(st, state.VM{}, false); err == nil {
+			t.Fatal("a teardown whose every command failed reported success")
+		}
+		if st.Network.LastCleanupAttemptAt == "" {
+			t.Error("LastCleanupAttemptAt is empty after a teardown that failed")
+		}
+		// The names are kept on this path so the next run can finish the job.
+		// The stamp is only worth anything next to them.
+		if st.Network.BridgeName != DefaultBridgeName {
+			t.Errorf("BridgeName = %q after a failed teardown, want it kept", st.Network.BridgeName)
+		}
+	})
+
+	// Multi-VM teardown: a sibling VM still needs the bridge, so only this
+	// VM's own tap goes and the network record is deliberately kept whole.
+	// The stamp belongs on that record too, otherwise the one teardown a
+	// multi-VM host performs most often is the one that leaves no trace.
+	t.Run("a teardown that left the bridge for a sibling", func(t *testing.T) {
+		h := newFakeHost(t)
+		h.conns[DefaultBridgeName] = true
+		h.conns[DefaultBridgeName+"-tap"] = true
+		h.bridges[DefaultBridgeName] = true
+		h.links[DefaultTapName] = true
+		h.slaves[DefaultBridgeName] = []string{DefaultTapName}
+
+		st := staleSharedState()
+		if err := CleanupLinuxBridge(st, state.VM{}, true); err != nil {
+			t.Fatalf("a teardown with a live sibling reported failure: %v", err)
+		}
+		if st.Network.LastCleanupAttemptAt == "" {
+			t.Error("LastCleanupAttemptAt is empty after a teardown that left the bridge up")
+		}
+		// CreatedByKairosLab has to survive for whichever VM finally removes
+		// the bridge, so this path keeps the record rather than clearing it.
+		if !st.Network.CreatedByKairosLab || st.Network.BridgeName != DefaultBridgeName {
+			t.Errorf("the network record was not kept for the sibling: %+v", st.Network)
+		}
+	})
+
+	// A host that is not Linux, and a network this run does not own, both
+	// return before any teardown is attempted. Stamping either would record an
+	// attempt that never happened.
+	t.Run("a network kairos-lab did not create", func(t *testing.T) {
+		newFakeHost(t)
+		st := staleSharedState()
+		st.Network.CreatedByKairosLab = false
+
+		if err := CleanupLinuxBridge(st, state.VM{}, false); err != nil {
+			t.Fatalf("CleanupLinuxBridge reported failure for a network it does not own: %v", err)
+		}
+		if st.Network.LastCleanupAttemptAt != "" {
+			t.Errorf("LastCleanupAttemptAt = %q for a network no teardown was attempted on", st.Network.LastCleanupAttemptAt)
+		}
+	})
+}
