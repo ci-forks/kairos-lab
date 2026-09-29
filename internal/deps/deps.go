@@ -119,7 +119,12 @@ func qemuDependency(info platform.Info) Dependency {
 				"dnf":    {"qemu-system-aarch64", "edk2-aarch64", "qemu-img"},
 				"yum":    {"qemu-kvm", "edk2-aarch64", "qemu-img"},
 				"zypper": {"qemu-arm", "qemu-uefi-aarch64", "qemu-tools"},
-				"pacman": {"qemu-system-aarch64", "edk2-aarch64"},
+				// qemu-img is a package of its own on Arch and nothing in
+				// qemu-system-aarch64's dependency closure pulls it in. The
+				// amd64 map below gets it for free because qemu-base depends
+				// on it; naming the emulator directly, as arm64 must, does
+				// not (kairos-io/kairos#5018).
+				"pacman": {"qemu-system-aarch64", "edk2-aarch64", "qemu-img"},
 				"apk":    {"qemu-system-aarch64", "aavmf", "qemu-img"},
 				"brew":   {"qemu"},
 			},
