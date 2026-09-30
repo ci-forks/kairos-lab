@@ -1,0 +1,892 @@
+package app
+
+import (
+	"bytes"
+	"os"
+	"path/filepath"
+	"slices"
+	"strconv"
+	"strings"
+	"testing"
+
+	"github.com/kairos-io/kairos-lab/internal/auroraboot"
+	"github.com/kairos-io/kairos-lab/internal/platform"
+	"github.com/kairos-io/kairos-lab/internal/state"
+)
+
+// runtimeStub is a stand-in for a container runtime binary. It logs every call
+// to $STUB_LOG, answers `info` and `--version`, treats the file "image" in
+// $STUB_DIR as the presence of the image, creates it on a successful pull, and
+// notes in "state-had-ref" whether state.json already named the image when the
+// pull started.
+const runtimeStub = `#!/bin/sh
+echo "$NAME $*" >> "$STUB_LOG"
+case "$1" in
+info) exit "${INFO_EXIT:-0}" ;;
+--version) echo "$VERSION_OUT"; exit 0 ;;
+image)
+	case "$2" in
+	inspect) [ -f "$STUB_DIR/image" ] && exit 0; exit 1 ;;
+	rm) PATH=/usr/bin:/bin rm -f "$STUB_DIR/image"; exit "${RM_EXIT:-0}" ;;
+	esac
+	;;
+pull)
+	while read -r line; do
+		case $line in
+		*auroraboot:v*) : > "$STUB_DIR/state-had-ref" ;;
+		esac
+	done < "$STATE_FILE"
+	[ "${PULL_EXIT:-0}" = 0 ] && : > "$STUB_DIR/image"
+	exit "${PULL_EXIT:-0}"
+	;;
+esac
+exit 0
+`
+
+type abEnv struct {
+	home    string
+	bin     string
+	stubDir string
+	log     string
+	store   *state.Store
+}
+
+// newABEnv isolates HOME, the state directories and PATH, and provides the
+// binaries the existing dependency check looks for, so setup gets past it
+// without touching the host.
+func newABEnv(t *testing.T) *abEnv {
+	t.Helper()
+	e := &abEnv{home: t.TempDir(), bin: t.TempDir(), stubDir: t.TempDir()}
+	t.Setenv("HOME", e.home)
+	t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
+	t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
+	t.Setenv("PATH", e.bin)
+	e.log = filepath.Join(e.stubDir, "log")
+	t.Setenv("STUB_LOG", e.log)
+	t.Setenv("STUB_DIR", e.stubDir)
+	store, err := state.DefaultStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.store = store
+	t.Setenv("STATE_FILE", store.StatePath)
+	for _, b := range []string{"qemu-img", "qemu-system-x86_64", "qemu-system-aarch64", "ip"} {
+		e.write(t, b, "#!/bin/sh\nexit 0\n")
+	}
+	oldPlatform, oldInstall, oldUninstall := detectPlatform, installPackages, uninstallPackages
+	t.Cleanup(func() { detectPlatform, installPackages, uninstallPackages = oldPlatform, oldInstall, oldUninstall })
+	uninstallPackages = func(pm string, pkgs []string, useSudo bool) error {
+		t.Errorf("uninstallPackages(%s, %v) called unexpectedly", pm, pkgs)
+		return nil
+	}
+	stubStaleNetwork(t, false)
+	installPackages = func(pm string, pkgs []string, useSudo bool) error {
+		t.Errorf("installPackages(%s, %v) called unexpectedly", pm, pkgs)
+		return nil
+	}
+	return e
+}
+
+func (e *abEnv) write(t *testing.T, name, content string) string {
+	t.Helper()
+	p := filepath.Join(e.bin, name)
+	if err := os.WriteFile(p, []byte(content), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+// runtime installs a runtime stub named name on PATH.
+func (e *abEnv) runtime(t *testing.T, name string) {
+	t.Helper()
+	e.write(t, name, strings.Replace(runtimeStub, "$NAME", name, 1))
+}
+
+func (e *abEnv) hasImage(t *testing.T) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(e.stubDir, "image"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func (e *abEnv) logText() string {
+	b, _ := os.ReadFile(e.log)
+	return string(b)
+}
+
+func (e *abEnv) load(t *testing.T) *state.State {
+	t.Helper()
+	st, err := e.store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return st
+}
+
+func (e *abEnv) setup(stdin string, args ...string) (string, error) {
+	var stdout, stderr bytes.Buffer
+	err := Run(append([]string{"setup"}, args...), strings.NewReader(stdin), &stdout, &stderr, "test")
+	return stdout.String(), err
+}
+
+func TestSetupRecordsPulledImageAndShim(t *testing.T) {
+	e := newABEnv(t)
+	e.runtime(t, "docker")
+	out, err := e.setup("", "-yes")
+	if err != nil {
+		t.Fatalf("setup: %v\n%s", err, out)
+	}
+	ref := auroraboot.ImageRef()
+	st := e.load(t)
+	ab := st.AuroraBoot
+	shimDir := filepath.Join(e.home, ".local", "bin")
+	if ab.Runtime != "docker" {
+		t.Errorf("runtime = %q, want docker", ab.Runtime)
+	}
+	if !slices.Equal(ab.PulledImages, []string{ref}) {
+		t.Errorf("pulled images = %v, want [%s]", ab.PulledImages, ref)
+	}
+	if len(ab.PreExistingImages) != 0 {
+		t.Errorf("pre-existing images = %v, want none", ab.PreExistingImages)
+	}
+	if want := filepath.Join(shimDir, "auroraboot"); ab.ShimPath != want {
+		t.Errorf("shim path = %q, want %q", ab.ShimPath, want)
+	}
+	if ab.ShimDirCreated != shimDir {
+		t.Errorf("shim dir created = %q, want %q", ab.ShimDirCreated, shimDir)
+	}
+	if !auroraboot.IsManagedShim(ab.ShimPath) {
+		t.Error("the installed shim lacks its marker")
+	}
+	if !slices.Contains(st.Setup.PreExistingDeps, "docker") {
+		t.Errorf("pre-existing deps = %v, want docker in them", st.Setup.PreExistingDeps)
+	}
+	if !strings.Contains(e.logText(), "docker pull "+ref) {
+		t.Errorf("no pull of %s in %q", ref, e.logText())
+	}
+	if _, err := os.Stat(filepath.Join(e.stubDir, "state-had-ref")); err != nil {
+		t.Error("state.json did not name the image when the pull started")
+	}
+	if !strings.Contains(out, "export PATH=") {
+		t.Errorf("no PATH hint although %s is not on PATH:\n%s", shimDir, out)
+	}
+	if !strings.Contains(out, "[5/5]") {
+		t.Errorf("no step 5 line:\n%s", out)
+	}
+
+	// A second run rewrites the shim and keeps every record.
+	if out, err := e.setup("", "-yes"); err != nil {
+		t.Fatalf("second setup: %v\n%s", err, out)
+	}
+	again := e.load(t).AuroraBoot
+	if again.ShimDirCreated != shimDir || !slices.Equal(again.PulledImages, []string{ref}) || len(again.PreExistingImages) != 0 {
+		t.Errorf("second run changed the record: %+v", again)
+	}
+}
+
+func TestSetupKeepsPreExistingImageUntracked(t *testing.T) {
+	e := newABEnv(t)
+	e.runtime(t, "docker")
+	e.hasImage(t)
+	out, err := e.setup("", "-yes")
+	if err != nil {
+		t.Fatalf("setup: %v\n%s", err, out)
+	}
+	ref := auroraboot.ImageRef()
+	ab := e.load(t).AuroraBoot
+	if len(ab.PulledImages) != 0 {
+		t.Errorf("pulled images = %v, want none for an image that was already there", ab.PulledImages)
+	}
+	if !slices.Equal(ab.PreExistingImages, []string{ref}) {
+		t.Errorf("pre-existing images = %v, want [%s]", ab.PreExistingImages, ref)
+	}
+	if strings.Contains(e.logText(), "docker pull") {
+		t.Errorf("the image was pulled although present: %q", e.logText())
+	}
+	if ab.ShimPath == "" {
+		t.Error("the shim was not installed")
+	}
+}
+
+func TestSetupSkipsWhenAuroraBootOnPath(t *testing.T) {
+	e := newABEnv(t)
+	e.runtime(t, "docker")
+	mine := "#!/bin/sh\necho mine\n"
+	e.write(t, "auroraboot", mine)
+	out, err := e.setup("", "-yes")
+	if err != nil {
+		t.Fatalf("setup: %v\n%s", err, out)
+	}
+	if ab := e.load(t).AuroraBoot; !isZeroAuroraBoot(ab) {
+		t.Errorf("state recorded %+v, want nothing", ab)
+	}
+	if !strings.Contains(out, "already installed at "+filepath.Join(e.bin, "auroraboot")) {
+		t.Errorf("output does not say why:\n%s", out)
+	}
+	if strings.Contains(e.logText(), "pull") {
+		t.Errorf("the image was pulled for a shim that will not be written: %q", e.logText())
+	}
+	if b, _ := os.ReadFile(filepath.Join(e.bin, "auroraboot")); string(b) != mine {
+		t.Error("the user's auroraboot was modified")
+	}
+}
+
+func TestAuroraBootStepSkipsWhenShimPathHoldsAForeignFile(t *testing.T) {
+	e := newABEnv(t)
+	e.runtime(t, "docker")
+	target := filepath.Join(e.home, ".local", "bin", "auroraboot")
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, []byte("#!/bin/sh\necho mine\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	out, err := e.setup("", "-yes")
+	if err != nil {
+		t.Fatalf("setup: %v\n%s", err, out)
+	}
+	if ab := e.load(t).AuroraBoot; !isZeroAuroraBoot(ab) {
+		t.Errorf("state recorded %+v, want nothing", ab)
+	}
+	if b, _ := os.ReadFile(target); string(b) != "#!/bin/sh\necho mine\n" {
+		t.Error("the file at the shim path was modified")
+	}
+}
+
+func isZeroAuroraBoot(ab state.AuroraBoot) bool {
+	return ab.Runtime == "" && ab.ShimPath == "" && ab.ShimDirCreated == "" &&
+		len(ab.PulledImages) == 0 && len(ab.PreExistingImages) == 0
+}
+
+func TestSetupNoAuroraBootFlag(t *testing.T) {
+	e := newABEnv(t)
+	e.runtime(t, "docker")
+	out, err := e.setup("", "-yes", "-no-auroraboot")
+	if err != nil {
+		t.Fatalf("setup: %v\n%s", err, out)
+	}
+	if e.logText() != "" {
+		t.Errorf("the runtime was called: %q", e.logText())
+	}
+	if ab := e.load(t).AuroraBoot; !isZeroAuroraBoot(ab) {
+		t.Errorf("state recorded %+v, want nothing", ab)
+	}
+	if _, err := os.Lstat(filepath.Join(e.home, ".local")); err == nil {
+		t.Error("~/.local was created")
+	}
+	if !e.load(t).Setup.DependencyCheckPassed {
+		t.Error("the rest of setup did not complete")
+	}
+}
+
+func TestSetupSavesStateBeforePullFailure(t *testing.T) {
+	e := newABEnv(t)
+	e.runtime(t, "docker")
+	t.Setenv("PULL_EXIT", "1")
+	out, err := e.setup("", "-yes")
+	if err == nil {
+		t.Fatalf("a failed pull was not reported:\n%s", out)
+	}
+	if _, serr := os.Stat(filepath.Join(e.stubDir, "state-had-ref")); serr != nil {
+		t.Error("state.json did not name the image when the pull started")
+	}
+	st := e.load(t)
+	if st.AuroraBoot.Runtime != "docker" || !slices.Contains(st.Setup.PreExistingDeps, "docker") {
+		t.Errorf("the runtime was not saved: %+v %v", st.AuroraBoot, st.Setup.PreExistingDeps)
+	}
+	if len(st.AuroraBoot.PulledImages) != 0 {
+		t.Errorf("pulled images = %v, want none after a failed pull", st.AuroraBoot.PulledImages)
+	}
+	if st.AuroraBoot.ShimPath != "" {
+		t.Error("a shim was recorded although the pull failed")
+	}
+	if !st.Setup.DependencyCheckPassed {
+		t.Error("the failed auroraboot step undid the rest of setup")
+	}
+}
+
+func TestSetupRuntimeFlagChoosesPodman(t *testing.T) {
+	e := newABEnv(t)
+	e.runtime(t, "docker")
+	e.runtime(t, "podman")
+	out, err := e.setup("", "-yes", "-runtime", "podman")
+	if err != nil {
+		t.Fatalf("setup: %v\n%s", err, out)
+	}
+	if got := e.load(t).AuroraBoot.Runtime; got != "podman" {
+		t.Errorf("runtime = %q, want podman", got)
+	}
+	log := e.logText()
+	if !strings.Contains(log, "podman pull "+auroraboot.ImageRef()) || strings.Contains(log, "docker pull") {
+		t.Errorf("wrong runtime pulled: %q", log)
+	}
+	b, err := os.ReadFile(e.load(t).AuroraBoot.ShimPath)
+	if err != nil || !strings.Contains(string(b), "runtime='podman'") {
+		t.Errorf("the shim does not run podman: %v", err)
+	}
+
+	// With no flag and both usable, docker is the default.
+	e2 := newABEnv(t)
+	e2.runtime(t, "docker")
+	e2.runtime(t, "podman")
+	if out, err := e2.setup("", "-yes"); err != nil {
+		t.Fatalf("setup: %v\n%s", err, out)
+	}
+	if got := e2.load(t).AuroraBoot.Runtime; got != "docker" {
+		t.Errorf("default runtime = %q, want docker", got)
+	}
+
+	if _, err := e2.setup("", "-yes", "-runtime", "nerdctl"); err == nil {
+		t.Error("an unsupported -runtime was accepted")
+	}
+}
+
+func TestAuroraBootStepDecliningThePullSkipsWithoutFailing(t *testing.T) {
+	e := newABEnv(t)
+	e.runtime(t, "docker")
+	out, err := e.setup("n\n")
+	if err != nil {
+		t.Fatalf("setup: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "2.2 GB") {
+		t.Errorf("the prompt does not state the size:\n%s", out)
+	}
+	if strings.Contains(e.logText(), "docker pull") {
+		t.Error("the image was pulled after declining")
+	}
+	st := e.load(t)
+	if st.AuroraBoot.ShimPath != "" || len(st.AuroraBoot.PulledImages) != 0 {
+		t.Errorf("state recorded %+v after declining", st.AuroraBoot)
+	}
+	if !st.Setup.DependencyCheckPassed {
+		t.Error("declining undid the rest of setup")
+	}
+}
+
+func TestAuroraBootStepInstallsARuntimeOnlyWhenNoneExists(t *testing.T) {
+	e := newABEnv(t)
+	detectPlatform = func() platform.Info {
+		return platform.Info{OS: "linux", Arch: "amd64", PackageManager: "apt"}
+	}
+	var installed [][]string
+	installPackages = func(pm string, pkgs []string, useSudo bool) error {
+		if pm != "apt" || !useSudo {
+			t.Errorf("install ran as pm=%s sudo=%v", pm, useSudo)
+		}
+		installed = append(installed, pkgs)
+		e.runtime(t, "docker")
+		return nil
+	}
+	out, err := e.setup("", "-yes")
+	if err != nil {
+		t.Fatalf("setup: %v\n%s", err, out)
+	}
+	if len(installed) != 1 || !slices.Equal(installed[0], []string{"docker.io"}) {
+		t.Errorf("installed %v, want [[docker.io]]", installed)
+	}
+	st := e.load(t)
+	if !slices.Contains(st.Setup.InstalledByKairosLab, "docker") {
+		t.Errorf("installed = %v, want docker tracked", st.Setup.InstalledByKairosLab)
+	}
+	if slices.Contains(st.Setup.PreExistingDeps, "docker") {
+		t.Errorf("pre-existing = %v: a runtime setup installed must stay removable", st.Setup.PreExistingDeps)
+	}
+	if st.AuroraBoot.Runtime != "docker" || st.AuroraBoot.ShimPath == "" {
+		t.Errorf("auroraboot state = %+v", st.AuroraBoot)
+	}
+
+	// A second run finds docker present and must not mark it pre-existing.
+	installPackages = func(string, []string, bool) error {
+		t.Error("installed again")
+		return nil
+	}
+	if out, err := e.setup("", "-yes"); err != nil {
+		t.Fatalf("second setup: %v\n%s", err, out)
+	}
+	if st := e.load(t); slices.Contains(st.Setup.PreExistingDeps, "docker") {
+		t.Errorf("a re-run made the installed runtime pre-existing: %v", st.Setup.PreExistingDeps)
+	}
+}
+
+func TestAuroraBootStepInstallsPodmanWhenAsked(t *testing.T) {
+	e := newABEnv(t)
+	detectPlatform = func() platform.Info {
+		return platform.Info{OS: "linux", Arch: "amd64", PackageManager: "dnf"}
+	}
+	var got []string
+	installPackages = func(pm string, pkgs []string, useSudo bool) error {
+		got = pkgs
+		e.runtime(t, "podman")
+		return nil
+	}
+	if out, err := e.setup("", "-yes", "-runtime", "podman"); err != nil {
+		t.Fatalf("setup: %v\n%s", err, out)
+	}
+	if !slices.Equal(got, []string{"podman"}) {
+		t.Errorf("installed %v, want [podman]", got)
+	}
+	if !slices.Contains(e.load(t).Setup.InstalledByKairosLab, "podman") {
+		t.Error("podman was not tracked as installed")
+	}
+}
+
+func TestAuroraBootStepNeverInstallsOverABrokenRuntime(t *testing.T) {
+	e := newABEnv(t)
+	detectPlatform = func() platform.Info {
+		return platform.Info{OS: "linux", Arch: "amd64", PackageManager: "apt"}
+	}
+	e.runtime(t, "docker")
+	t.Setenv("INFO_EXIT", "1")
+	out, err := e.setup("", "-yes")
+	if err != nil {
+		t.Fatalf("setup: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "docker info") {
+		t.Errorf("output does not say why docker is unusable:\n%s", out)
+	}
+	if ab := e.load(t).AuroraBoot; !isZeroAuroraBoot(ab) {
+		t.Errorf("state recorded %+v, want nothing", ab)
+	}
+}
+
+func TestAuroraBootStepExplainsAnInstalledDockerThatDoesNotWorkYet(t *testing.T) {
+	e := newABEnv(t)
+	detectPlatform = func() platform.Info {
+		return platform.Info{OS: "linux", Arch: "amd64", PackageManager: "pacman"}
+	}
+	installPackages = func(pm string, pkgs []string, useSudo bool) error {
+		e.runtime(t, "docker")
+		t.Setenv("INFO_EXIT", "1")
+		return nil
+	}
+	out, err := e.setup("", "-yes")
+	if err != nil {
+		t.Fatalf("setup: %v\n%s", err, out)
+	}
+	for _, want := range []string{"systemctl enable --now docker", "usermod -aG docker", "does not change groups"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output lacks %q:\n%s", want, out)
+		}
+	}
+	st := e.load(t)
+	if !slices.Contains(st.Setup.InstalledByKairosLab, "docker") {
+		t.Error("the installed docker was not tracked")
+	}
+	if st.AuroraBoot.ShimPath != "" {
+		t.Error("a shim was written for a runtime that does not work")
+	}
+}
+
+// seedCleanupState writes a completed-setup state.json for the cleanup tests,
+// after mutate has had its say.
+func (e *abEnv) seedCleanupState(t *testing.T, mutate func(*state.State)) {
+	t.Helper()
+	st := state.NewState(e.store)
+	st.Platform = state.Platform{OS: "linux", Arch: "amd64", PackageManager: "apt"}
+	st.Setup.CompletedAt = state.NowRFC3339()
+	st.Setup.DependencyCheckPassed = true
+	mutate(st)
+	if err := e.store.Save(st); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// installShim puts a real shim where setup would and returns its path and the
+// directory that holds it.
+func (e *abEnv) installShim(t *testing.T) (path, dir string) {
+	t.Helper()
+	content, err := auroraboot.RenderShim("docker", auroraboot.ImageRef(), "linux")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir = auroraboot.ShimDir(e.home)
+	path, _, err = auroraboot.InstallShim(dir, content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return path, dir
+}
+
+func (e *abEnv) cleanup(t *testing.T, args ...string) (string, error) {
+	t.Helper()
+	var stdout, stderr bytes.Buffer
+	err := Run(append([]string{"cleanup"}, args...), strings.NewReader(""), &stdout, &stderr, "test")
+	return stdout.String(), err
+}
+
+func TestCleanupRemovesShimImagesAndInstalledRuntime(t *testing.T) {
+	e := newABEnv(t)
+	e.runtime(t, "docker")
+	e.hasImage(t)
+	ref := auroraboot.ImageRef()
+	shim, dir := e.installShim(t)
+	e.seedCleanupState(t, func(st *state.State) {
+		st.Setup.InstalledByKairosLab = []string{"docker"}
+		st.AuroraBoot = state.AuroraBoot{Runtime: "docker", PulledImages: []string{ref}, ShimPath: shim, ShimDirCreated: dir}
+	})
+	var uninstalled []string
+	uninstallPackages = func(pm string, pkgs []string, useSudo bool) error {
+		if !strings.Contains(e.logText(), "docker image rm "+ref) {
+			t.Error("the runtime was uninstalled before its image was removed")
+		}
+		uninstalled = append(uninstalled, pm+":"+strings.Join(pkgs, ","))
+		return nil
+	}
+
+	plan, err := e.cleanup(t, "-dry-run")
+	if err != nil {
+		t.Fatalf("dry-run: %v\n%s", err, plan)
+	}
+	for _, want := range []string{"Will remove auroraboot shim:\n  - " + shim, "Will remove images (docker):\n  - " + ref, "  - docker.io"} {
+		if !strings.Contains(plan, want) {
+			t.Errorf("plan lacks %q:\n%s", want, plan)
+		}
+	}
+	if _, err := os.Lstat(shim); err != nil {
+		t.Fatal("-dry-run removed the shim")
+	}
+
+	out, err := e.cleanup(t, "-yes")
+	if err != nil {
+		t.Fatalf("cleanup: %v\n%s", err, out)
+	}
+	if _, err := os.Lstat(shim); !os.IsNotExist(err) {
+		t.Errorf("the shim is still there: %v", err)
+	}
+	if _, err := os.Lstat(dir); !os.IsNotExist(err) {
+		t.Errorf("the shim directory created by setup is still there: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(e.home, ".local")); err != nil {
+		t.Errorf("the parent of the shim directory was removed: %v", err)
+	}
+	if !strings.Contains(e.logText(), "docker image rm "+ref) {
+		t.Errorf("the image was not removed: %q", e.logText())
+	}
+	if len(uninstalled) != 1 || uninstalled[0] != "apt:docker.io" {
+		t.Errorf("uninstalled = %v, want [apt:docker.io]", uninstalled)
+	}
+	if _, err := os.Stat(e.store.StatePath); !os.IsNotExist(err) {
+		t.Error("the state file is still there")
+	}
+}
+
+func TestCleanupReportsAnImageThatCannotBeRemoved(t *testing.T) {
+	e := newABEnv(t)
+	e.runtime(t, "docker")
+	e.hasImage(t)
+	t.Setenv("RM_EXIT", "1")
+	shim, dir := e.installShim(t)
+	e.seedCleanupState(t, func(st *state.State) {
+		st.AuroraBoot = state.AuroraBoot{Runtime: "docker", PulledImages: []string{auroraboot.ImageRef()}, ShimPath: shim, ShimDirCreated: dir}
+	})
+	out, err := e.cleanup(t, "-yes")
+	if err == nil || !strings.Contains(err.Error(), "cleanup incomplete") {
+		t.Fatalf("err = %v, want cleanup incomplete\n%s", err, out)
+	}
+	if strings.Contains(out, "cleanup complete") {
+		t.Errorf("cleanup reported completion:\n%s", out)
+	}
+	if _, err := os.Lstat(shim); !os.IsNotExist(err) {
+		t.Error("a failed image removal stopped the shim from being removed")
+	}
+}
+
+func TestCleanupKeepsPreExistingRuntimeAndImage(t *testing.T) {
+	e := newABEnv(t)
+	e.runtime(t, "docker")
+	e.hasImage(t)
+	ref := auroraboot.ImageRef()
+	shim, dir := e.installShim(t)
+	e.seedCleanupState(t, func(st *state.State) {
+		st.Setup.PreExistingDeps = []string{"docker"}
+		st.AuroraBoot = state.AuroraBoot{Runtime: "docker", PreExistingImages: []string{ref}, ShimPath: shim}
+	})
+	plan, err := e.cleanup(t, "-dry-run")
+	if err != nil {
+		t.Fatalf("dry-run: %v\n%s", err, plan)
+	}
+	if !strings.Contains(plan, "Will keep images (pre-existing):\n  - "+ref) {
+		t.Errorf("plan does not say the image is kept:\n%s", plan)
+	}
+	out, err := e.cleanup(t, "-yes")
+	if err != nil {
+		t.Fatalf("cleanup: %v\n%s", err, out)
+	}
+	if _, err := os.Lstat(shim); !os.IsNotExist(err) {
+		t.Error("the shim was not removed")
+	}
+	if strings.Contains(e.logText(), "image rm") {
+		t.Errorf("a pre-existing image was removed: %q", e.logText())
+	}
+	if _, err := os.Lstat(dir); err != nil {
+		t.Errorf("a directory setup did not create was removed: %v", err)
+	}
+}
+
+func TestCleanupRejectsPoisonedRuntime(t *testing.T) {
+	e := newABEnv(t)
+	marker := filepath.Join(t.TempDir(), "ran")
+	evil := filepath.Join(t.TempDir(), "evil")
+	if err := os.WriteFile(evil, []byte("#!/bin/sh\n: > "+marker+"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	e.seedCleanupState(t, func(st *state.State) {
+		st.AuroraBoot = state.AuroraBoot{Runtime: evil, PulledImages: []string{auroraboot.ImageRef()}}
+	})
+	out, err := e.cleanup(t, "-yes")
+	if err != nil {
+		t.Fatalf("cleanup: %v\n%s", err, out)
+	}
+	if _, err := os.Stat(marker); err == nil {
+		t.Fatal("the runtime named in state.json was executed")
+	}
+	if !strings.Contains(out, "unsupported container runtime") {
+		t.Errorf("the plan does not say why the runtime is skipped:\n%s", out)
+	}
+}
+
+func TestCleanupRejectsPoisonedImageAndShim(t *testing.T) {
+	e := newABEnv(t)
+	e.runtime(t, "docker")
+	foreign := filepath.Join(e.home, "mine")
+	if err := os.WriteFile(foreign, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	e.seedCleanupState(t, func(st *state.State) {
+		st.AuroraBoot = state.AuroraBoot{
+			Runtime:        "docker",
+			PulledImages:   []string{"alpine:latest", auroraboot.ImageRepo + ":v1 --all"},
+			ShimPath:       foreign,
+			ShimDirCreated: e.home,
+		}
+	})
+	out, err := e.cleanup(t, "-yes")
+	if err != nil {
+		t.Fatalf("cleanup: %v\n%s", err, out)
+	}
+	if strings.Contains(e.logText(), "image rm") {
+		t.Errorf("an image that fails validation reached the runtime: %q", e.logText())
+	}
+	if _, err := os.Lstat(foreign); err != nil {
+		t.Error("a file without the marker was removed")
+	}
+	if _, err := os.Lstat(e.home); err != nil {
+		t.Error("a directory that is not the shim directory was removed")
+	}
+	for _, want := range []string{"not an auroraboot shim written by kairos-lab", "not the directory setup creates", "not an auroraboot image reference"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("plan lacks the reason %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestStatusShowsAuroraBoot(t *testing.T) {
+	e := newABEnv(t)
+	ref := auroraboot.ImageRef()
+	var stdout, stderr bytes.Buffer
+
+	e.seedCleanupState(t, func(*state.State) {})
+	if err := Run([]string{"status"}, strings.NewReader(""), &stdout, &stderr, "test"); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(stdout.String(), "auroraboot") {
+		t.Errorf("status mentions auroraboot with nothing recorded:\n%s", stdout.String())
+	}
+
+	e.seedCleanupState(t, func(st *state.State) {
+		st.AuroraBoot = state.AuroraBoot{
+			Runtime:           "docker",
+			PulledImages:      []string{ref},
+			PreExistingImages: []string{"quay.io/kairos/auroraboot:v0.1.0"},
+			ShimPath:          "/home/u/.local/bin/auroraboot",
+		}
+	})
+	stdout.Reset()
+	if err := Run([]string{"status"}, strings.NewReader(""), &stdout, &stderr, "test"); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"auroraboot runtime: docker\n",
+		"auroraboot shim: /home/u/.local/bin/auroraboot\n",
+		"auroraboot images pulled by kairos-lab: " + ref + "\n",
+		"auroraboot images pre-existing: quay.io/kairos/auroraboot:v0.1.0\n",
+	} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Errorf("status lacks %q:\n%s", want, stdout.String())
+		}
+	}
+
+	e.seedCleanupState(t, func(st *state.State) {
+		st.AuroraBoot = state.AuroraBoot{
+			Runtime:           injectedRuntimeName,
+			PulledImages:      []string{injectedImageRef},
+			PreExistingImages: []string{injectedImageRef},
+			ShimPath:          injectedShimPath,
+		}
+	})
+	stdout.Reset()
+	if err := Run([]string{"status"}, strings.NewReader(""), &stdout, &stderr, "test"); err != nil {
+		t.Fatal(err)
+	}
+	assertPlanIsInert(t, stdout.String())
+	for _, v := range []string{injectedRuntimeName, injectedImageRef, injectedShimPath} {
+		if !strings.Contains(stdout.String(), strconv.Quote(v)) {
+			t.Errorf("status does not carry %q in escaped form:\n%q", v, stdout.String())
+		}
+	}
+}
+
+type installCall struct {
+	pm      string
+	pkgs    []string
+	useSudo bool
+}
+
+func darwinPlatform() platform.Info {
+	return platform.Info{OS: "darwin", Arch: "arm64", PackageManager: "brew"}
+}
+
+// TestAuroraBootStepDarwinInstallsDockerDesktopThenCompletesOnRerun is the
+// two-run flow on macOS: the first run installs the cask and stops with
+// instructions because Docker Desktop is not running, the second finds it
+// running and pulls the image and writes the shim.
+func TestAuroraBootStepDarwinInstallsDockerDesktopThenCompletesOnRerun(t *testing.T) {
+	e := newABEnv(t)
+	detectPlatform = darwinPlatform
+	var calls []installCall
+	installPackages = func(pm string, pkgs []string, useSudo bool) error {
+		calls = append(calls, installCall{pm, pkgs, useSudo})
+		e.runtime(t, "docker")
+		t.Setenv("INFO_EXIT", "1")
+		return nil
+	}
+	// One "y" only: any second prompt, such as a sudo one, would read EOF and
+	// decline, and the install would not happen.
+	out, err := e.setup("y\n")
+	if err != nil {
+		t.Fatalf("setup: %v\n%s", err, out)
+	}
+	if len(calls) != 1 || calls[0].pm != "brew-cask" || !slices.Equal(calls[0].pkgs, []string{"docker-desktop"}) || calls[0].useSudo {
+		t.Errorf("install calls = %+v, want one brew-cask docker-desktop without sudo", calls)
+	}
+	want := "open Docker Desktop once and wait until it reports it is running, then run 'kairos-lab setup' again to pull the image and install the auroraboot command"
+	if !strings.Contains(out, want) {
+		t.Errorf("no follow-up instruction:\n%s", out)
+	}
+	if strings.Contains(e.logText(), "pull") {
+		t.Errorf("an image was pulled with a runtime that is not running: %q", e.logText())
+	}
+	st := e.load(t)
+	if !slices.Contains(st.Setup.InstalledByKairosLab, "docker") || slices.Contains(st.Setup.PreExistingDeps, "docker") {
+		t.Errorf("installed=%v pre-existing=%v: the runtime must be tracked as installed", st.Setup.InstalledByKairosLab, st.Setup.PreExistingDeps)
+	}
+	if st.AuroraBoot.ShimPath != "" || len(st.AuroraBoot.PulledImages) != 0 {
+		t.Errorf("state recorded %+v for a skipped step", st.AuroraBoot)
+	}
+	if !st.Setup.DependencyCheckPassed {
+		t.Error("the rest of setup did not complete")
+	}
+
+	// Docker Desktop is running now.
+	t.Setenv("INFO_EXIT", "0")
+	installPackages = func(pm string, pkgs []string, useSudo bool) error {
+		t.Errorf("installed again: %s %v", pm, pkgs)
+		return nil
+	}
+	out, err = e.setup("", "-yes")
+	if err != nil {
+		t.Fatalf("second setup: %v\n%s", err, out)
+	}
+	st = e.load(t)
+	if !strings.Contains(e.logText(), "docker pull "+auroraboot.ImageRef()) {
+		t.Errorf("the second run did not pull: %q", e.logText())
+	}
+	if st.AuroraBoot.ShimPath == "" || st.AuroraBoot.Runtime != "docker" {
+		t.Errorf("the second run did not finish: %+v", st.AuroraBoot)
+	}
+	if !slices.Contains(st.Setup.InstalledByKairosLab, "docker") || slices.Contains(st.Setup.PreExistingDeps, "docker") {
+		t.Errorf("the re-run lost track of the install: installed=%v pre-existing=%v", st.Setup.InstalledByKairosLab, st.Setup.PreExistingDeps)
+	}
+}
+
+func TestAuroraBootStepDarwinInstallsPodmanFormula(t *testing.T) {
+	e := newABEnv(t)
+	detectPlatform = darwinPlatform
+	var calls []installCall
+	installPackages = func(pm string, pkgs []string, useSudo bool) error {
+		calls = append(calls, installCall{pm, pkgs, useSudo})
+		e.runtime(t, "podman")
+		t.Setenv("INFO_EXIT", "125")
+		return nil
+	}
+	out, err := e.setup("y\n", "-runtime", "podman")
+	if err != nil {
+		t.Fatalf("setup: %v\n%s", err, out)
+	}
+	if len(calls) != 1 || calls[0].pm != "brew" || !slices.Equal(calls[0].pkgs, []string{"podman"}) || calls[0].useSudo {
+		t.Errorf("install calls = %+v, want one brew podman without sudo", calls)
+	}
+	want := "run 'podman machine init' and 'podman machine start', then run 'kairos-lab setup' again to pull the image and install the auroraboot command"
+	if !strings.Contains(out, want) {
+		t.Errorf("no follow-up instruction:\n%s", out)
+	}
+	st := e.load(t)
+	if !slices.Contains(st.Setup.InstalledByKairosLab, "podman") || st.AuroraBoot.ShimPath != "" {
+		t.Errorf("installed=%v auroraboot=%+v", st.Setup.InstalledByKairosLab, st.AuroraBoot)
+	}
+}
+
+func TestAuroraBootStepDarwinDeclinedInstallSkips(t *testing.T) {
+	e := newABEnv(t)
+	detectPlatform = darwinPlatform
+	if out, err := e.setup("n\n"); err != nil {
+		t.Fatalf("setup: %v\n%s", err, out)
+	}
+	if ab := e.load(t).AuroraBoot; !isZeroAuroraBoot(ab) {
+		t.Errorf("state recorded %+v, want nothing", ab)
+	}
+}
+
+func TestCleanupUninstallsInstalledRuntimesOnDarwin(t *testing.T) {
+	e := newABEnv(t)
+	e.seedCleanupState(t, func(st *state.State) {
+		st.Platform = state.Platform{OS: "darwin", Arch: "arm64", PackageManager: "brew"}
+		st.Setup.InstalledByKairosLab = []string{"docker", "podman"}
+	})
+	var calls []installCall
+	uninstallPackages = func(pm string, pkgs []string, useSudo bool) error {
+		calls = append(calls, installCall{pm, pkgs, useSudo})
+		return nil
+	}
+	plan, err := e.cleanup(t, "-dry-run")
+	if err != nil {
+		t.Fatalf("dry-run: %v\n%s", err, plan)
+	}
+	for _, want := range []string{"Will uninstall dependencies (Homebrew cask):\n  - docker-desktop", "Will uninstall dependencies:\n  - podman", "podman machine rm"} {
+		if !strings.Contains(plan, want) {
+			t.Errorf("plan lacks %q:\n%s", want, plan)
+		}
+	}
+	if out, err := e.cleanup(t, "-yes"); err != nil {
+		t.Fatalf("cleanup: %v\n%s", err, out)
+	}
+	got := map[string]string{}
+	for _, c := range calls {
+		got[c.pm] = strings.Join(c.pkgs, ",")
+	}
+	if len(calls) != 2 || got["brew-cask"] != "docker-desktop" || got["brew"] != "podman" {
+		t.Errorf("uninstall calls = %+v, want brew-cask docker-desktop and brew podman", calls)
+	}
+}
+
+func TestCleanupKeepsPreExistingRuntimeOnDarwin(t *testing.T) {
+	e := newABEnv(t)
+	e.seedCleanupState(t, func(st *state.State) {
+		st.Platform = state.Platform{OS: "darwin", Arch: "arm64", PackageManager: "brew"}
+		st.Setup.PreExistingDeps = []string{"docker", "podman"}
+		st.Setup.InstalledByKairosLab = []string{"docker", "podman"}
+	})
+	if out, err := e.cleanup(t, "-yes"); err != nil {
+		t.Fatalf("cleanup: %v\n%s", err, out)
+	}
+}

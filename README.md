@@ -10,6 +10,7 @@ After you've played with kairos-lab, whether you choose to continue your Kairos 
 
 It helps you:
 
+- get an `auroraboot` command that builds Kairos ISOs from container images (`setup`)
 - download a Kairos ISO (`download`)
 - boot a Kairos VM with shared networking by default (`start`)
 - manage multiple VM disks
@@ -80,6 +81,15 @@ go build -o kairos-lab ./cmd/kairos-lab
 ```
 
 Detects your package manager and installs required tools (`qemu`) if missing.
+It also gives you an `auroraboot` command, so you can build your own ISO:
+
+```bash
+auroraboot build-iso --output ./build quay.io/kairos/alpine:3.21-core-amd64-generic-v3.7.2
+```
+
+The command is a small script in `~/.local/bin` that runs a pinned
+[AuroraBoot](https://github.com/kairos-io/AuroraBoot) container image on Docker
+or podman. See [`setup`](#setup) for what it installs and how to opt out.
 
 ### 2) Download a Kairos ISO
 
@@ -126,6 +136,62 @@ After installing Kairos to the disk, start again:
 Select your existing disk - it will boot from disk without the ISO.
 
 ## Commands
+
+### `setup`
+
+Checks for the tools kairos-lab needs, installs what is missing, and sets up the
+`auroraboot` command:
+
+- A container runtime is needed to run AuroraBoot. Docker is the default, and
+  podman works too. If both are usable, `-runtime` picks one; otherwise the
+  first one that works is used, Docker before podman. A runtime counts as
+  usable when `<runtime> info` succeeds, and a `docker` that is really podman
+  counts as podman.
+- If the machine has no runtime at all, setup installs one, after asking (and
+  asking again before it uses sudo on Linux). Docker is the default, podman with
+  `-runtime podman`. It never installs a runtime over one that is present but
+  broken, and it says why it skipped.
+  - Linux: the distribution's `docker` or `podman` package. Docker still needs
+    its service started and your user in the `docker` group. Setup prints the
+    commands and changes neither itself.
+  - macOS: with Homebrew, `brew install --cask docker-desktop` for Docker, or
+    `brew install podman`. Neither needs sudo.
+- Setup never starts anything and never creates a VM. A runtime it just
+  installed is not usable yet, so that run stops after printing what to do, and
+  skips the image pull and the shim without failing: open Docker Desktop once
+  and wait until it reports it is running (Docker), or run `podman machine init`
+  and `podman machine start` (podman on macOS). Then run `setup` again. The
+  second run finds the runtime usable, pulls the image and installs the
+  `auroraboot` command. The runtime is recorded as installed by kairos-lab, so
+  `cleanup` can remove it.
+- Setup pulls the pinned image (`quay.io/kairos/auroraboot`, an exact tag, never
+  `latest`) after asking, since it is about 2.2 GB. Declining skips this step
+  and the rest of setup still completes.
+- The shim is written to `~/.local/bin/auroraboot`. If that directory is not on
+  your `PATH`, setup prints the `export PATH=...` line to add. It never edits
+  your shell configuration.
+- If an `auroraboot` that setup did not write is already on your `PATH` or at
+  that path, setup leaves it alone and records nothing.
+
+Flags:
+- `-runtime docker|podman` - Container runtime for `auroraboot`
+- `-no-auroraboot` - Do not provide the `auroraboot` command
+- `-yes` - Auto-confirm prompts (installs, sudo and the image pull)
+
+The shim runs the image with your current directory mounted at the same
+absolute path and as the working directory, so relative paths in the arguments
+mean the same thing inside the container. Any other existing host path named in
+the arguments is mounted at its own path too, and an `--output` directory that
+does not exist yet is created. Paths that would shadow system directories such
+as `/etc` or `/usr` are refused. The arguments themselves are passed through
+unchanged. Values given to `--set` are not scanned for paths, and
+`AURORABOOT_*` environment variables are not passed into the container.
+
+`build-iso` without `--output` currently writes the ISO inside the container,
+where it is lost when the container exits, although AuroraBoot's help text says
+current directory. Always pass `--output <dir>`; the shim prints a warning when
+you forget. AuroraBoot's default is being changed, and the warning goes away
+once the pinned image includes that change.
 
 ### `download`
 
@@ -188,7 +254,13 @@ Removes everything created by `kairos-lab`:
 - All disks and runtime files
 - Downloaded ISOs
 - Network configuration
-- Dependencies installed by the tool (not pre-existing ones)
+- The `auroraboot` shim, and `~/.local/bin` if setup created it and it is empty
+- The AuroraBoot image, if setup pulled it (an image that was already there is kept)
+- Dependencies installed by the tool (not pre-existing ones), including a
+  container runtime setup installed. On macOS that is `brew uninstall --cask
+  docker-desktop` or `brew uninstall podman`, and the plan labels the cask as a
+  Homebrew cask. A podman machine you created is not removed; remove it with
+  `podman machine rm`
 
 ## Networking
 
@@ -322,6 +394,8 @@ By default:
 - Config/state: `$XDG_CONFIG_HOME/kairos-lab/` (or `~/.config/kairos-lab/`)
 - Cache/artifacts: `$XDG_CACHE_HOME/kairos-lab/` (or `~/.cache/kairos-lab/`)
 
+The `auroraboot` command, when setup provides it, is `~/.local/bin/auroraboot`.
+
 Override with environment variables:
 - `KAIROS_LAB_CONFIG_DIR`
 - `KAIROS_LAB_CACHE_DIR`
@@ -329,7 +403,17 @@ Override with environment variables:
 ## Safety
 
 - Cleanup only removes what the tool created
-- Dependencies that existed before setup are never removed
+- Dependencies that existed before setup are never removed. That includes a
+  container runtime and an AuroraBoot image that were there before setup, on
+  Linux and on macOS: they are recorded as pre-existing and cleanup keeps them.
+  Only a runtime that setup itself installed is uninstalled
+- Cleanup removes the `auroraboot` shim only if it is a regular file that
+  carries the line `# kairos-lab-managed: auroraboot shim`, so a script of your
+  own with that name is never touched. It removes `~/.local/bin` only when
+  setup created it and it is empty
+- Under rootful Docker the container runs as root, so ISOs and other output
+  written by `auroraboot` are owned by root. Remove them with `sudo`, or run
+  podman rootless
 - Network cleanup reconnects your physical interface after `bridged`, but
   only when it is what deleted the bridge-slave profile that had put the
   interface on the bridge: `nmcli device connect <iface>` activates whichever

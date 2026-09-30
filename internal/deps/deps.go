@@ -12,6 +12,24 @@ type Dependency struct {
 	Name            string
 	Binaries        []string
 	InstallPackages map[string][]string
+	// Cask marks a dependency whose brew package is a Homebrew cask, not a
+	// formula. It changes only how brew is called; see BrewCask.
+	Cask bool
+}
+
+// BrewCask is the pseudo package manager name Install and Uninstall accept for
+// `brew install --cask` and `brew uninstall --cask`. It exists so the package
+// list and the package manager travel together through the same calls a
+// formula takes.
+const BrewCask = "brew-cask"
+
+// ManagerFor returns the package manager name to hand Install or Uninstall for
+// this dependency: BrewCask for a cask under brew, pm otherwise.
+func (d Dependency) ManagerFor(pm string) string {
+	if pm == "brew" && d.Cask {
+		return BrewCask
+	}
+	return pm
 }
 
 func Required(info platform.Info) []Dependency {
@@ -32,6 +50,51 @@ func Required(info platform.Info) []Dependency {
 		})
 	}
 	return deps
+}
+
+// Docker and Podman are the container runtimes the auroraboot shim can run on.
+// They are deliberately not part of Required: setup installs one only when the
+// machine has no runtime at all, so they are asked for separately and recorded
+// under the runtime's own name. On macOS brew installs docker as the
+// docker-desktop cask (the old cask name "docker" no longer exists) and podman
+// as a formula; neither needs sudo.
+//
+// dnf's moby-engine is Fedora's package; RHEL and its rebuilds have no docker
+// package at all, and setup reports the failure rather than guess at another
+// repository. Installing docker also leaves its service disabled and the user
+// outside the docker group; setup tells the user, it does not change either.
+func Docker() Dependency {
+	return Dependency{
+		Name:     "docker",
+		Binaries: []string{"docker"},
+		Cask:     true,
+		InstallPackages: map[string][]string{
+			"brew":   {"docker-desktop"},
+			"apt":    {"docker.io"},
+			"dnf":    {"moby-engine"},
+			"yum":    {"docker"},
+			"zypper": {"docker"},
+			"pacman": {"docker"},
+			"apk":    {"docker"},
+		},
+	}
+}
+
+// Podman is the daemonless alternative to Docker; see Docker.
+func Podman() Dependency {
+	return Dependency{
+		Name:     "podman",
+		Binaries: []string{"podman"},
+		InstallPackages: map[string][]string{
+			"brew":   {"podman"},
+			"apt":    {"podman"},
+			"dnf":    {"podman"},
+			"yum":    {"podman"},
+			"zypper": {"podman"},
+			"pacman": {"podman"},
+			"apk":    {"podman"},
+		},
+	}
 }
 
 func DetectPresent(dep Dependency) bool {

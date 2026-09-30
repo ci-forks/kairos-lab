@@ -131,6 +131,24 @@ var packageProviders = map[string]map[string][]string{
 		"apk":    {"qemu-img"},
 		"brew":   {"qemu"},
 	},
+	"docker": {
+		"brew":   {"docker-desktop"},
+		"apt":    {"docker.io"},
+		"dnf":    {"moby-engine", "docker-ce"},
+		"yum":    {"docker", "docker-ce"},
+		"zypper": {"docker"},
+		"pacman": {"docker"},
+		"apk":    {"docker"},
+	},
+	"podman": {
+		"brew":   {"podman"},
+		"apt":    {"podman"},
+		"dnf":    {"podman"},
+		"yum":    {"podman"},
+		"zypper": {"podman"},
+		"pacman": {"podman"},
+		"apk":    {"podman"},
+	},
 	"ip": {
 		"apt":    {"iproute2"},
 		"dnf":    {"iproute"},
@@ -177,5 +195,90 @@ func TestEveryDeclaredBinaryHasAPackageThatShipsIt(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+var linuxPackageManagers = []string{"apt", "dnf", "yum", "zypper", "pacman", "apk"}
+
+func TestRuntimeDepsCoverEveryLinuxPackageManager(t *testing.T) {
+	for _, dep := range []Dependency{Docker(), Podman()} {
+		for _, pm := range linuxPackageManagers {
+			pkgs, err := InstallablePackages(pm, []Dependency{dep})
+			if err != nil {
+				t.Fatalf("%s: %v", dep.Name, err)
+			}
+			if len(pkgs) == 0 {
+				t.Errorf("%s has no %s package", dep.Name, pm)
+			}
+			for _, binary := range dep.Binaries {
+				providers, ok := packageProviders[binary][pm]
+				if !ok {
+					t.Fatalf("test gap: no %s package is recorded as shipping %q", pm, binary)
+				}
+				if !slices.ContainsFunc(providers, func(p string) bool {
+					return slices.Contains(pkgs, p)
+				}) {
+					t.Errorf("%s packages %v for %q ship none of %v", pm, pkgs, dep.Name, providers)
+				}
+			}
+			uninstall, err := UninstallablePackages(pm, []string{dep.Name}, []Dependency{dep})
+			if err != nil || !slices.Equal(uninstall, pkgs) {
+				t.Errorf("%s/%s: uninstall = %v, %v; want %v", dep.Name, pm, uninstall, err, pkgs)
+			}
+		}
+	}
+}
+
+func TestRuntimeDepsNotInRequired(t *testing.T) {
+	for _, info := range []platform.Info{
+		{OS: "linux", Arch: "amd64"},
+		{OS: "linux", Arch: "arm64"},
+		{OS: "darwin", Arch: "amd64"},
+		{OS: "darwin", Arch: "arm64"},
+	} {
+		for _, dep := range Required(info) {
+			if dep.Name == "docker" || dep.Name == "podman" {
+				t.Errorf("%s/%s: Required includes %q, which setup must only install on request", info.OS, info.Arch, dep.Name)
+			}
+		}
+	}
+}
+
+func TestRuntimeDepsBrewUsesCaskForDockerOnly(t *testing.T) {
+	docker, podman := Docker(), Podman()
+	if pkgs, err := InstallablePackages("brew", []Dependency{docker}); err != nil || !slices.Equal(pkgs, []string{"docker-desktop"}) {
+		t.Errorf("docker on brew = %v, %v; want [docker-desktop]", pkgs, err)
+	}
+	if pkgs, err := InstallablePackages("brew", []Dependency{podman}); err != nil || !slices.Equal(pkgs, []string{"podman"}) {
+		t.Errorf("podman on brew = %v, %v; want [podman]", pkgs, err)
+	}
+	if got := docker.ManagerFor("brew"); got != BrewCask {
+		t.Errorf("docker manager on brew = %q, want %q", got, BrewCask)
+	}
+	if got := docker.ManagerFor("apt"); got != "apt" {
+		t.Errorf("docker manager on apt = %q, want apt", got)
+	}
+	if got := podman.ManagerFor("brew"); got != "brew" {
+		t.Errorf("podman manager on brew = %q, want brew", got)
+	}
+}
+
+func TestBrewCaskCommands(t *testing.T) {
+	inst, err := installCommands(BrewCask, []string{"docker-desktop"}, false)
+	if err != nil || len(inst) != 1 || !slices.Equal(inst[0], []string{"brew", "install", "--cask", "docker-desktop"}) {
+		t.Errorf("cask install = %v, %v", inst, err)
+	}
+	un, err := uninstallCommand(BrewCask, []string{"docker-desktop"}, false)
+	if err != nil || !slices.Equal(un, []string{"brew", "uninstall", "--cask", "docker-desktop"}) {
+		t.Errorf("cask uninstall = %v, %v", un, err)
+	}
+	// The formula path is unchanged.
+	inst, _ = installCommands("brew", []string{"qemu"}, false)
+	if !slices.Equal(inst[0], []string{"brew", "install", "qemu"}) {
+		t.Errorf("formula install = %v", inst)
+	}
+	un, _ = uninstallCommand("brew", []string{"qemu"}, false)
+	if !slices.Equal(un, []string{"brew", "uninstall", "qemu"}) {
+		t.Errorf("formula uninstall = %v", un)
 	}
 }

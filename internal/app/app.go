@@ -21,6 +21,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"github.com/kairos-io/kairos-lab/internal/auroraboot"
 	"github.com/kairos-io/kairos-lab/internal/cleanup"
 	"github.com/kairos-io/kairos-lab/internal/deps"
 	"github.com/kairos-io/kairos-lab/internal/iso"
@@ -105,22 +106,27 @@ func rejectPositionalArgs(fs *flag.FlagSet, hint string) error {
 func runSetup(args []string, stdin io.Reader, stdout, _ io.Writer, store *state.Store) error {
 	fs := flag.NewFlagSet("setup", flag.ContinueOnError)
 	autoYes := fs.Bool("yes", false, "auto-confirm installs and sudo operations")
+	noAuroraBoot := fs.Bool("no-auroraboot", false, "do not provide the auroraboot command")
+	runtimeFlag := fs.String("runtime", "", "container runtime for the auroraboot command: docker or podman (default: the first one that works, else docker)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if err := rejectPositionalArgs(fs, ""); err != nil {
 		return err
 	}
+	if *runtimeFlag != "" && !auroraboot.ValidRuntime(*runtimeFlag) {
+		return fmt.Errorf("invalid -runtime %q: use docker or podman", *runtimeFlag)
+	}
 
-	writeLine(stdout, "[1/4] Detecting platform and package manager")
+	writeLine(stdout, "[1/5] Detecting platform and package manager")
 	st, err := store.Load()
 	if err != nil {
 		return err
 	}
-	p := platform.Detect()
+	p := detectPlatform()
 	st.Platform = state.Platform{OS: p.OS, Arch: p.Arch, PackageManager: p.PackageManager}
 
-	writeLine(stdout, "[2/4] Checking required dependencies")
+	writeLine(stdout, "[2/5] Checking required dependencies")
 	required := deps.Required(p)
 	present := deps.PresentNames(required)
 	missing := deps.Missing(required)
@@ -153,20 +159,36 @@ func runSetup(args []string, stdin io.Reader, stdout, _ io.Writer, store *state.
 				return fmt.Errorf("sudo permission denied")
 			}
 		}
-		writeLine(stdout, "[3/4] Installing missing dependencies")
-		if err := deps.Install(p.PackageManager, pkgs, useSudo); err != nil {
+		writeLine(stdout, "[3/5] Installing missing dependencies")
+		if err := installPackages(p.PackageManager, pkgs, useSudo); err != nil {
 			return err
 		}
 		st.Setup.InstalledByKairosLab = mergeUnique(st.Setup.InstalledByKairosLab, missingNames)
+		// Saved now rather than at the end: the packages are on the machine
+		// whatever happens next, and cleanup can only remove what state names.
+		if err := store.Save(st); err != nil {
+			return err
+		}
 	} else {
-		writeLine(stdout, "[3/4] All dependencies already present")
+		writeLine(stdout, "[3/5] All dependencies already present")
 	}
 
-	writeLine(stdout, "[4/4] Writing state")
+	writeLine(stdout, "[4/5] Writing state")
 	st.Setup.DependencyCheckPassed = true
 	st.Setup.CompletedAt = state.NowRFC3339()
 	if err := store.Save(st); err != nil {
 		return err
+	}
+
+	// After the state is written, so a failure here cannot leave the VM
+	// workflow unusable.
+	if *noAuroraBoot {
+		writeLine(stdout, "[5/5] Skipping the auroraboot command (-no-auroraboot)")
+	} else {
+		writeLine(stdout, "[5/5] Setting up the auroraboot command")
+		if err := setupAuroraBoot(stdin, stdout, *autoYes, *runtimeFlag, p, st, store); err != nil {
+			return fmt.Errorf("the qemu dependencies are set up, but the auroraboot command is not: %w", err)
+		}
 	}
 	writef(stdout, "setup complete (%s/%s, pkg manager: %s)\n", p.OS, p.Arch, p.PackageManager)
 	return nil
@@ -1746,6 +1768,13 @@ func runStatus(stdout io.Writer, store *state.Store) error {
 	writef(stdout, "dependencies installed by kairos-lab: %s\n", joinOrNone(st.Setup.InstalledByKairosLab))
 	writef(stdout, "managed dirs: %s\n", joinOrNone(st.ManagedDirs))
 	writef(stdout, "managed files: %s\n", joinOrNone(st.ManagedFiles))
+	if hasAuroraBootState(st.AuroraBoot) {
+		// Stored values again, so the same two renderers that escape them.
+		writef(stdout, "auroraboot runtime: %s\n", emptyAsNone(st.AuroraBoot.Runtime))
+		writef(stdout, "auroraboot shim: %s\n", emptyAsNone(st.AuroraBoot.ShimPath))
+		writef(stdout, "auroraboot images pulled by kairos-lab: %s\n", joinOrNone(st.AuroraBoot.PulledImages))
+		writef(stdout, "auroraboot images pre-existing: %s\n", joinOrNone(st.AuroraBoot.PreExistingImages))
+	}
 
 	// One block per VM (M5), in the order state.json carries them -- disk
 	// name, mode, tap, running, pid, address are all per-VM now, where a
@@ -2062,23 +2091,44 @@ func runCleanup(args []string, stdin io.Reader, stdout io.Writer, store *state.S
 	}
 	removeDeps := cleanup.DependenciesToRemove(st.Setup.PreExistingDeps, st.Setup.InstalledByKairosLab)
 	required := deps.Required(pinfo)
+	// A container runtime is looked up beside the required dependencies, but
+	// never part of them: setup installs one only on request.
+	removable := append(append([]deps.Dependency{}, required...), runtimeDepsFor(pm)...)
 	pkgRemovals := []string{}
+	caskRemovals := []string{}
 	if len(removeDeps) > 0 && pm != "" {
-		pkgRemovals, err = deps.UninstallablePackages(pm, removeDeps, required)
+		// A runtime that brew installed as a cask is uninstalled with
+		// --cask, so it is looked up and reported apart from the formulas.
+		caskNames, formulaNames := splitCaskNames(pm, removeDeps)
+		pkgRemovals, err = deps.UninstallablePackages(pm, formulaNames, removable)
+		if err != nil {
+			return err
+		}
+		caskRemovals, err = deps.UninstallablePackages(pm, caskNames, runtimeDepsFor(pm))
 		if err != nil {
 			return err
 		}
 	}
+	podmanRemoved := slices.Contains(removeDeps, "podman") && len(pkgRemovals) > 0 && pm == "brew"
 
 	filesToRemove, filesToSkip := splitRemovalPaths(st.ManagedFiles, st)
 	dirsToRemove, dirsToSkip := splitRemovalPaths(st.ManagedDirs, st)
+	home, _ := os.UserHomeDir()
+	abPlan := planAuroraBootCleanup(st.AuroraBoot, home)
 
 	writeLine(stdout, "cleanup plan:")
 	printList(stdout, "Will remove files", filesToRemove)
 	printListWithReasons(stdout, "Will skip files", filesToSkip)
 	printList(stdout, "Will remove directories", dirsToRemove)
 	printListWithReasons(stdout, "Will skip directories", dirsToSkip)
+	printAuroraBootPlan(stdout, st.AuroraBoot, abPlan)
 	printList(stdout, "Will uninstall dependencies", pkgRemovals)
+	if len(caskRemovals) > 0 {
+		printList(stdout, "Will uninstall dependencies (Homebrew cask)", caskRemovals)
+	}
+	if podmanRemoved {
+		writeLine(stdout, "note: a podman machine you created is not removed; remove it with 'podman machine rm'")
+	}
 	printList(stdout, "Will keep dependencies (pre-existing)", st.Setup.PreExistingDeps)
 
 	hasStaleNetwork := hasStaleNetworkResources(st)
@@ -2180,7 +2230,11 @@ func runCleanup(args []string, stdin io.Reader, stdout io.Writer, store *state.S
 		}
 	}
 
-	if len(pkgRemovals) > 0 && pm != "" {
+	// The shim and the images go before the packages: removing an image takes
+	// the runtime, and the runtime may be one of the packages about to go.
+	auroraBootErr := cleanupAuroraBoot(stdout, abPlan, home)
+
+	if len(pkgRemovals)+len(caskRemovals) > 0 && pm != "" {
 		useSudo := runtime.GOOS == "linux"
 		if useSudo {
 			ok, err := confirm(stdin, stdout, *autoYes, "remove kairos-lab-installed dependencies with sudo")
@@ -2191,8 +2245,15 @@ func runCleanup(args []string, stdin io.Reader, stdout io.Writer, store *state.S
 				return fmt.Errorf("cleanup cancelled")
 			}
 		}
-		if err := deps.Uninstall(pm, pkgRemovals, useSudo); err != nil {
-			return err
+		if len(pkgRemovals) > 0 {
+			if err := uninstallPackages(pm, pkgRemovals, useSudo); err != nil {
+				return err
+			}
+		}
+		if len(caskRemovals) > 0 {
+			if err := uninstallPackages(deps.BrewCask, caskRemovals, useSudo); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -2220,6 +2281,9 @@ func runCleanup(args []string, stdin io.Reader, stdout io.Writer, store *state.S
 	if networkCleanupErr != nil {
 		return fmt.Errorf("cleanup incomplete: files and dependencies were removed, but the network cleanup did not finish: %w. What it names is still on the host, and stored configuration is gone, so remove those connections and links with nmcli by hand", networkCleanupErr)
 	}
+	if auroraBootErr != nil {
+		return fmt.Errorf("cleanup incomplete: files and dependencies were removed, but part of the auroraboot command was not: %w. Stored configuration is gone, so remove what it names by hand", auroraBootErr)
+	}
 	writeLine(stdout, "cleanup complete")
 	return nil
 }
@@ -2233,7 +2297,7 @@ func printUsage(w io.Writer) {
 	writeLine(w, "  kairos-lab start                Boot existing disk (after install)")
 	writeLine(w, "")
 	writeLine(w, "Commands:")
-	writeLine(w, "  setup                Detect/install dependencies")
+	writeLine(w, "  setup [flags]        Detect/install dependencies and the auroraboot command")
 	writeLine(w, "  download             Download a Kairos ISO (interactive selection)")
 	writeLine(w, "  start [flags]        Boot VM (select/create disk, optionally attach ISO)")
 	writeLine(w, "  status               Show state and runtime information")
@@ -2270,6 +2334,11 @@ func printUsage(w io.Writer) {
 	writeLine(w, "  -iso <path>          Use specific ISO file")
 	writef(w, "  -network <mode>      %s\n", modeUsageDescription("Network mode", networkModes, defaultNetworkMode))
 	writef(w, "  -display <mode>      %s\n", modeUsageDescription("Display mode", displayModes, defaultDisplayMode))
+	writeLine(w, "")
+	writeLine(w, "Setup flags:")
+	writeLine(w, "  -yes                 Auto-confirm installs, sudo and the image pull")
+	writeLine(w, "  -runtime <name>      Container runtime for auroraboot: docker|podman")
+	writeLine(w, "  -no-auroraboot       Do not provide the auroraboot command")
 	writeLine(w, "")
 	writeLine(w, "Exit VM with Ctrl-a x (QEMU serial console quit)")
 }
